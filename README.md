@@ -293,6 +293,7 @@ Begin an ACID transaction. Returns a `Transaction` object.
 | `await txn.getString(key, durabilityLevel?)` | Read as UTF-8 string |
 | `await txn.delete(key)` | Delete within the transaction |
 | `await txn.merge(key, value, ttl?)` | Merge within the transaction |
+| `await txn.markRead(keys)` | Mark keys as read for SSI conflict detection |
 | `await txn.scan(start?, end?, durabilityLevel?)` | Range scan within the transaction |
 | `await txn.scanPrefix(prefix, durabilityLevel?)` | Prefix scan within the transaction |
 | `await txn.commit(awaitDurable?)` | Commit (throws on conflict) |
@@ -365,13 +366,13 @@ Compaction is **fully automatic**. When `SlateDB.open()` is called, SlateDB spaw
 
 ## Test
 
-Integration tests are organized in 16 groups — 52 tests total:
+Integration tests are organized in 16 groups — 53 tests total:
 
 | Group                   | Tests | Description                                                    |
 | ----------------------- | ----: | -------------------------------------------------------------- |
 | **full_example.rs**     |     5 | Ported from SlateDB's [`examples/src/full_example.rs`](https://github.com/slatedb/slatedb/blob/main/examples/src/full_example.rs) |
 | **write batch**         |     4 | Atomic multi-put, deletes, non-durable, free-without-write     |
-| **transactions**        |     6 | Commit, rollback, read-your-writes, delete, isolation          |
+| **transactions**        |     7 | Commit, rollback, read-your-writes, delete, isolation, markRead |
 | **bridge extras**       |     8 | Binary keys, empty values, overwrite, scan order, edge cases   |
 | **scan_prefix**         |     3 | Prefix scan, no matches, different prefixes                    |
 | **snapshot**            |     4 | Point-in-time reads, snapshot scan, scanPrefix, getString      |
@@ -497,7 +498,7 @@ The Rust layer (`src/lib.rs`) exposes native JS classes via napi-rs `#[napi]` ma
 | **SlateDB**       | `open`, `close`, `put`, `get`, `getString`, `delete`, `merge`, `flush`, `scan`, `scanPrefix`, `writeBatch`, `begin`, `snapshot`, `createCheckpoint`, `metrics` | Database lifecycle + all ops |
 | **DbReader**      | `open`, `close`, `get`, `getString`, `scan`, `scanPrefix`                       | Read-only multi-reader     |
 | **WriteBatch**    | `new`, `put`, `merge`, `delete`, `free`                                         | Atomic batch writes        |
-| **Transaction**   | `put`, `get`, `getString`, `delete`, `merge`, `scan`, `scanPrefix`, `commit`, `rollback` | ACID transactions          |
+| **Transaction**   | `put`, `get`, `getString`, `delete`, `merge`, `markRead`, `scan`, `scanPrefix`, `commit`, `rollback` | ACID transactions          |
 | **Snapshot**      | `get`, `getString`, `scan`, `scanPrefix`                                        | Read-only point-in-time    |
 
 All async Rust futures are automatically converted to JS Promises by napi-rs. The Tokio runtime is managed internally by napi-rs.

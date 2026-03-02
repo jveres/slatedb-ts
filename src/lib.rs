@@ -935,6 +935,20 @@ impl JsTransaction {
         txn.delete(&key[..]).map_err(to_napi_err)
     }
 
+    /// Explicitly mark keys as read for conflict detection under
+    /// SerializableSnapshot isolation. This is useful when reads happen
+    /// outside the transaction but should still participate in conflict
+    /// checking.
+    #[napi(js_name = "markRead")]
+    pub async fn mark_read(&self, keys: Vec<Buffer>) -> Result<()> {
+        let guard = self.inner.lock().await;
+        let txn = guard
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
+        txn.mark_read(keys.iter().map(|k| &k[..]))
+            .map_err(to_napi_err)
+    }
+
     /// Merge within the transaction.
     #[napi]
     pub async fn merge(&self, key: Buffer, value: Buffer, ttl: Option<u32>) -> Result<()> {

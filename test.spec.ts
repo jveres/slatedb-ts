@@ -211,6 +211,30 @@ for (const url of urls) {
 
       expect(str(await db.get(Buffer.from("iso")))).toBe("serializable");
     });
+
+    test("markRead tracks keys for SSI conflict detection", async () => {
+      // Setup: write initial key
+      await db.put(Buffer.from("mr_k"), Buffer.from("v1"), false);
+
+      // txn1 reads key, marks it, then writes something else
+      const txn1 = await db.begin(IsolationLevel.SerializableSnapshot);
+      await txn1.get(Buffer.from("mr_k"));
+      await txn1.markRead([Buffer.from("mr_k")]);
+      await txn1.put(Buffer.from("mr_other"), Buffer.from("x"));
+
+      // txn2 modifies the same key and commits first
+      const txn2 = await db.begin(IsolationLevel.SerializableSnapshot);
+      await txn2.put(Buffer.from("mr_k"), Buffer.from("v2"));
+      await txn2.commit(false);
+
+      // txn1 commit should fail — read key was modified
+      try {
+        await txn1.commit(false);
+        expect(true).toBe(false); // should not reach
+      } catch (e: any) {
+        expect(e.message.toLowerCase()).toContain("conflict");
+      }
+    });
   });
 
   describe(`[${label}] bridge extras`, () => {
