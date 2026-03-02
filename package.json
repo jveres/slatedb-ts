@@ -4,7 +4,7 @@
   "type": "module",
   "main": "index.ts",
   "scripts": {
-    "build": "cargo build --release && cp target/release/libslatedb_napi.dylib slatedb_napi.darwin-arm64.node",
+    "build": "cargo build --release && rm -f slatedb_napi.darwin-arm64.node && cp target/release/libslatedb_napi.dylib slatedb_napi.darwin-arm64.node && codesign -s - slatedb_napi.darwin-arm64.node",
     "test": "bun test",
     "bench": "bun run bench.ts",
     "bencher": "bun run bencher.ts",

@@ -8,8 +8,8 @@ use slatedb::config::{
     CheckpointOptions, CheckpointScope, DurabilityLevel, FlushOptions, FlushType, MergeOptions,
     PutOptions, ReadOptions, ScanOptions, Settings, Ttl, WriteOptions,
 };
-use slatedb::{MergeOperator, MergeOperatorError};
 use slatedb::{Db, DbIterator, DbTransaction, WriteBatch};
+use slatedb::{MergeOperator, MergeOperatorError};
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,10 +84,7 @@ fn build_flush_options(flush_type: Option<JsFlushType>) -> FlushOptions {
     }
 }
 
-fn make_range(
-    start: &Option<Buffer>,
-    end: &Option<Buffer>,
-) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+fn make_range(start: &Option<Buffer>, end: &Option<Buffer>) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
     let lo = match start {
         Some(b) => Bound::Included(b.to_vec()),
         None => Bound::Unbounded,
@@ -331,6 +328,10 @@ impl SlateDB {
     // -----------------------------------------------------------------------
 
     /// Put a key-value pair.
+    ///
+    /// # Safety
+    /// Called from JS via napi-rs. The `&mut self` borrow is safe because
+    /// napi-rs prevents concurrent mutable access from JavaScript.
     #[napi]
     pub async unsafe fn put(
         &mut self,
@@ -340,18 +341,23 @@ impl SlateDB {
         ttl: Option<u32>,
     ) -> Result<()> {
         self.db
-            .put_with_options(&key[..], &value[..], &build_put_options(ttl.map(|v| v as u64)), wo(await_durable))
+            .put_with_options(
+                &key[..],
+                &value[..],
+                &build_put_options(ttl.map(|v| v as u64)),
+                wo(await_durable),
+            )
             .await
             .map_err(to_napi_err)
     }
 
     /// Delete a key.
+    ///
+    /// # Safety
+    /// Called from JS via napi-rs. The `&mut self` borrow is safe because
+    /// napi-rs prevents concurrent mutable access from JavaScript.
     #[napi]
-    pub async unsafe fn delete(
-        &mut self,
-        key: Buffer,
-        await_durable: Option<bool>,
-    ) -> Result<()> {
+    pub async unsafe fn delete(&mut self, key: Buffer, await_durable: Option<bool>) -> Result<()> {
         self.db
             .delete_with_options(&key[..], wo(await_durable))
             .await
@@ -364,6 +370,10 @@ impl SlateDB {
 
     /// Merge a value into the database using the configured merge operator.
     /// Requires a merge operator to be set via settings in open().
+    ///
+    /// # Safety
+    /// Called from JS via napi-rs. The `&mut self` borrow is safe because
+    /// napi-rs prevents concurrent mutable access from JavaScript.
     #[napi]
     pub async unsafe fn merge(
         &mut self,
@@ -397,7 +407,12 @@ impl SlateDB {
         read_level: Option<JsDurabilityLevel>,
     ) -> Result<Option<Buffer>> {
         let opts = build_read_options(read_level);
-        match self.db.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
+        match self
+            .db
+            .get_with_options(&key[..], &opts)
+            .await
+            .map_err(to_napi_err)?
+        {
             Some(val) => Ok(Some(Buffer::from(val.to_vec()))),
             None => Ok(None),
         }
@@ -411,7 +426,12 @@ impl SlateDB {
         read_level: Option<JsDurabilityLevel>,
     ) -> Result<Option<String>> {
         let opts = build_read_options(read_level);
-        match self.db.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
+        match self
+            .db
+            .get_with_options(&key[..], &opts)
+            .await
+            .map_err(to_napi_err)?
+        {
             Some(val) => {
                 let s = String::from_utf8(val.to_vec())
                     .map_err(|e| Error::from_reason(format!("invalid UTF-8: {e}")))?;
@@ -437,7 +457,11 @@ impl SlateDB {
     ) -> Result<Vec<KeyValue>> {
         let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
         let range = make_range(&start, &end);
-        let iter = self.db.scan_with_options(range, &opts).await.map_err(to_napi_err)?;
+        let iter = self
+            .db
+            .scan_with_options(range, &opts)
+            .await
+            .map_err(to_napi_err)?;
         collect_iter(iter).await
     }
 
@@ -477,6 +501,10 @@ impl SlateDB {
     // -----------------------------------------------------------------------
 
     /// Write a batch atomically.
+    ///
+    /// # Safety
+    /// Called from JS via napi-rs. The `&mut self` borrow is safe because
+    /// napi-rs prevents concurrent mutable access from JavaScript.
     #[napi(js_name = "writeBatch")]
     pub async unsafe fn write_batch(
         &mut self,
@@ -504,9 +532,7 @@ impl SlateDB {
     pub async fn begin(&self, isolation: Option<JsIsolationLevel>) -> Result<JsTransaction> {
         let level = match isolation.unwrap_or(JsIsolationLevel::Snapshot) {
             JsIsolationLevel::Snapshot => slatedb::IsolationLevel::Snapshot,
-            JsIsolationLevel::SerializableSnapshot => {
-                slatedb::IsolationLevel::SerializableSnapshot
-            }
+            JsIsolationLevel::SerializableSnapshot => slatedb::IsolationLevel::SerializableSnapshot,
         };
         let txn = self.db.begin(level).await.map_err(to_napi_err)?;
         Ok(JsTransaction {
@@ -583,6 +609,10 @@ impl SlateDB {
     // -----------------------------------------------------------------------
 
     /// Close the database and free native resources.
+    ///
+    /// # Safety
+    /// Called from JS via napi-rs. The `&mut self` borrow is safe because
+    /// napi-rs prevents concurrent mutable access from JavaScript.
     #[napi]
     pub async unsafe fn close(&mut self) -> Result<()> {
         self.db.close().await.map_err(to_napi_err)
@@ -604,6 +634,12 @@ pub struct JsMetric {
 #[napi(js_name = "WriteBatch")]
 pub struct JsWriteBatch {
     inner: Mutex<Option<WriteBatch>>,
+}
+
+impl Default for JsWriteBatch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[napi]
@@ -695,13 +731,21 @@ impl JsTransaction {
 
     /// Get within the transaction.
     #[napi]
-    pub async fn get(&self, key: Buffer, read_level: Option<JsDurabilityLevel>) -> Result<Option<Buffer>> {
+    pub async fn get(
+        &self,
+        key: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+    ) -> Result<Option<Buffer>> {
         let guard = self.inner.lock().await;
         let txn = guard
             .as_ref()
             .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
         let opts = build_read_options(read_level);
-        match txn.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
+        match txn
+            .get_with_options(&key[..], &opts)
+            .await
+            .map_err(to_napi_err)?
+        {
             Some(val) => Ok(Some(Buffer::from(val.to_vec()))),
             None => Ok(None),
         }
@@ -709,13 +753,21 @@ impl JsTransaction {
 
     /// Get within the transaction as UTF-8 string.
     #[napi(js_name = "getString")]
-    pub async fn get_string(&self, key: Buffer, read_level: Option<JsDurabilityLevel>) -> Result<Option<String>> {
+    pub async fn get_string(
+        &self,
+        key: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+    ) -> Result<Option<String>> {
         let guard = self.inner.lock().await;
         let txn = guard
             .as_ref()
             .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
         let opts = build_read_options(read_level);
-        match txn.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
+        match txn
+            .get_with_options(&key[..], &opts)
+            .await
+            .map_err(to_napi_err)?
+        {
             Some(val) => {
                 let s = String::from_utf8(val.to_vec())
                     .map_err(|e| Error::from_reason(format!("invalid UTF-8: {e}")))?;
@@ -767,7 +819,10 @@ impl JsTransaction {
             .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
         let opts = build_scan_options(read_level, None, None);
         let range = make_range(&start, &end);
-        let iter = txn.scan_with_options(range, &opts).await.map_err(to_napi_err)?;
+        let iter = txn
+            .scan_with_options(range, &opts)
+            .await
+            .map_err(to_napi_err)?;
         collect_iter(iter).await
     }
 
@@ -827,9 +882,18 @@ pub struct JsSnapshot {
 impl JsSnapshot {
     /// Get raw bytes by key.
     #[napi]
-    pub async fn get(&self, key: Buffer, read_level: Option<JsDurabilityLevel>) -> Result<Option<Buffer>> {
+    pub async fn get(
+        &self,
+        key: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+    ) -> Result<Option<Buffer>> {
         let opts = build_read_options(read_level);
-        match self.inner.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
+        match self
+            .inner
+            .get_with_options(&key[..], &opts)
+            .await
+            .map_err(to_napi_err)?
+        {
             Some(val) => Ok(Some(Buffer::from(val.to_vec()))),
             None => Ok(None),
         }
@@ -837,9 +901,18 @@ impl JsSnapshot {
 
     /// Get value as UTF-8 string.
     #[napi(js_name = "getString")]
-    pub async fn get_string(&self, key: Buffer, read_level: Option<JsDurabilityLevel>) -> Result<Option<String>> {
+    pub async fn get_string(
+        &self,
+        key: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+    ) -> Result<Option<String>> {
         let opts = build_read_options(read_level);
-        match self.inner.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
+        match self
+            .inner
+            .get_with_options(&key[..], &opts)
+            .await
+            .map_err(to_napi_err)?
+        {
             Some(val) => {
                 let s = String::from_utf8(val.to_vec())
                     .map_err(|e| Error::from_reason(format!("invalid UTF-8: {e}")))?;
@@ -861,7 +934,11 @@ impl JsSnapshot {
     ) -> Result<Vec<KeyValue>> {
         let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
         let range = make_range(&start, &end);
-        let iter = self.inner.scan_with_options(range, &opts).await.map_err(to_napi_err)?;
+        let iter = self
+            .inner
+            .scan_with_options(range, &opts)
+            .await
+            .map_err(to_napi_err)?;
         collect_iter(iter).await
     }
 
