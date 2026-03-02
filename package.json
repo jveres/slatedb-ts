@@ -1,0 +1,14 @@
+{
+  "name": "slatedb",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "build": "cargo build --release",
+    "test": "bun test",
+    "bench": "bun run bench.ts",
+    "bencher": "bun run bencher.ts",
+    "bencher:db": "bun run bencher.ts db",
+    "bencher:txn": "bun run bencher.ts transaction"
+  }
+}
