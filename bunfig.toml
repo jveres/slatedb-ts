@@ -1,7 +1,6 @@
 [test]
-# Cloud backends (S3, Azure, GCS) need longer timeouts because each durable
-# write blocks on: flush interval (100ms) + object store round-trip (~50-200ms).
-# SlateDB's own integration test (tests/db.rs) uses await_durable=false for
-# this reason — but we test the default (durable) code path, so we extend the
-# timeout. In-memory and filesystem tests finish in <2s regardless.
+# Extended timeout for cloud backends (S3, Azure, GCS).
+# SlateDB.open() and db.close() each perform multiple object store round-trips
+# (manifest read/create, fencing, flush). Bun's test timeout cannot interrupt
+# FFI block_on calls, but this prevents false timeouts between tests.
 timeout = 30000

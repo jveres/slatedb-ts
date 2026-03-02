@@ -132,15 +132,22 @@ pub extern "C" fn slatedb_get(
     }
 }
 
-/// Delete. Returns 0 on success, -1 on error.
+/// Delete. `await_durable`: 1 = wait for persistence (default), 0 = return immediately.
+/// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn slatedb_delete(
     h: *mut DbHandle,
     key: *const u8, key_len: usize,
+    await_durable: i32,
 ) -> i32 {
     let db = &unsafe { &*h }.db;
     let k = unsafe { std::slice::from_raw_parts(key, key_len) };
-    match RT.block_on(db.delete(k)) {
+    let result = if await_durable == 0 {
+        RT.block_on(db.delete_with_options(k, &WriteOptions { await_durable: false }))
+    } else {
+        RT.block_on(db.delete(k))
+    };
+    match result {
         Ok(_) => 0,
         Err(e) => { eprintln!("slatedb_delete: {e}"); -1 }
     }

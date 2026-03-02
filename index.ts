@@ -13,7 +13,7 @@ const { symbols: ffi } = dlopen(LIB, {
   // kv ops
   slatedb_put:        { args: [FFIType.ptr, FFIType.ptr, FFIType.u64, FFIType.ptr, FFIType.u64, FFIType.i32], returns: FFIType.i32 },
   slatedb_get:        { args: [FFIType.ptr, FFIType.ptr, FFIType.u64],                          returns: FFIType.ptr },
-  slatedb_delete:     { args: [FFIType.ptr, FFIType.ptr, FFIType.u64],                          returns: FFIType.i32 },
+  slatedb_delete:     { args: [FFIType.ptr, FFIType.ptr, FFIType.u64, FFIType.i32],              returns: FFIType.i32 },
   slatedb_flush:      { args: [FFIType.ptr],                                                    returns: FFIType.i32 },
   // scan
   slatedb_scan:       { args: [FFIType.ptr, FFIType.ptr, FFIType.u64, FFIType.ptr, FFIType.u64], returns: FFIType.ptr },
@@ -118,9 +118,9 @@ export class SlateDB {
   }
 
   /** Delete a key. */
-  delete(key: string | Uint8Array): void {
+  delete(key: string | Uint8Array, awaitDurable = true): void {
     const k = encode(key);
-    if (ffi.slatedb_delete(this.#h, ptr(k), k.byteLength) !== 0)
+    if (ffi.slatedb_delete(this.#h, ptr(k), k.byteLength, awaitDurable ? 1 : 0) !== 0)
       throw new Error("delete failed");
   }
 

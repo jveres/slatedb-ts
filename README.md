@@ -106,9 +106,9 @@ Get raw bytes. Returns `null` if not found.
 
 Convenience — decodes the value as UTF-8.
 
-### `db.delete(key)`
+### `db.delete(key, awaitDurable?)`
 
-Delete a key.
+Delete a key. `awaitDurable` defaults to `true` (same semantics as `put`).
 
 ### `db.scan(start?, end?)` → `KeyValue[]`
 
@@ -188,7 +188,7 @@ SLATEDB_TEST_URLS="az://my-container" bun test
 
 Every backend listed in `SLATEDB_TEST_URLS` (comma-separated) gets the full 23-test suite. Each run uses unique timestamped paths to avoid collisions on persistent stores.
 
-**Write pattern:** Tests use `awaitDurable=false` for writes with explicit `flush()` where durability is needed. This matches SlateDB's own cloud-compatible integration test ([`tests/db.rs`](https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs)), which uses the same pattern because `awaitDurable=true` blocks the calling thread on every object store round-trip (flush interval + network latency). Non-durable writes land in the memtable immediately and are visible within the same process — no flush needed for read-after-write consistency.
+**Cloud backend design:** Tests share one DB per group (`beforeAll`/`afterAll`) to minimize object store round-trips — `SlateDB.open()` and `db.close()` each perform multiple S3 operations (manifest, fencing, flush). All writes use `awaitDurable=false` with explicit `flush()` where needed. This matches SlateDB's own cloud-compatible integration test ([`tests/db.rs`](https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs)). Non-durable writes land in the memtable immediately and are visible within the same process — no flush needed for read-after-write consistency.
 
 ## Benchmark
 

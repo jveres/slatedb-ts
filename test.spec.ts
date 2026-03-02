@@ -1,32 +1,23 @@
 /**
  * Integration test — faithful port of SlateDB's `examples/src/full_example.rs`.
  *
- * Runs against every backend specified in SLATEDB_TEST_URLS (comma-separated),
- * defaulting to in-memory. Each backend gets a unique path per run to avoid
- * cross-run collisions on persistent stores.
+ * Uses one DB per test group (beforeAll/afterAll) to minimize object store
+ * round-trips. This matches how SlateDB's own cloud-compatible test
+ * (tests/db.rs) operates — a single DB shared across all operations.
  *
  * All writes use `awaitDurable=false` with explicit `flush()` where needed,
- * matching SlateDB's own cloud-compatible test pattern (tests/db.rs). This
- * avoids blocking Bun's main thread on every S3/Azure round-trip — reads
- * still see the data because non-durable writes land in the memtable
+ * matching SlateDB's own pattern. Non-durable writes land in the memtable
  * immediately and are visible within the same process.
  *
  * Usage:
  *   bun test                                              # in-memory only
  *   SLATEDB_TEST_URLS=":memory:,file:///tmp/slate" bun test
- *   SLATEDB_TEST_URLS="s3://my-bucket" bun test           # needs AWS_* env vars
- *
- * Supported URL schemes (via object_store crate):
- *   :memory:        — in-memory (default, no config)
- *   file:///path    — local filesystem
- *   s3://bucket     — AWS S3       (needs AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)
- *   az://container  — Azure Blob   (needs AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_ACCOUNT_KEY)
- *   gs://bucket     — Google Cloud  (needs GOOGLE_SERVICE_ACCOUNT)
+ *   SLATEDB_TEST_URLS="s3://my-bucket" bun test
  *
  * @see https://github.com/slatedb/slatedb/blob/main/examples/src/full_example.rs
  * @see https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs
  */
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { SlateDB, WriteBatch, Transaction, IsolationLevel } from "./index";
 
 // ---------------------------------------------------------------------------
@@ -54,11 +45,11 @@ for (const url of urls) {
   describe(`[${label}] full_example.rs`, () => {
     let db: SlateDB;
 
-    beforeEach(() => {
+    beforeAll(() => {
       db = SlateDB.open(uniquePath("full"), url);
     });
 
-    afterEach(() => {
+    afterAll(() => {
       db.close();
     });
 
@@ -68,64 +59,54 @@ for (const url of urls) {
     });
 
     test("delete removes the key", () => {
-      db.put("test_key", "test_value", false);
-      expect(db.getString("test_key")).toBe("test_value");
+      db.put("del_key", "del_value", false);
+      expect(db.getString("del_key")).toBe("del_value");
 
-      db.delete("test_key");
-      expect(db.get("test_key")).toBeNull();
+      db.delete("del_key", false);
+      expect(db.get("del_key")).toBeNull();
     });
 
     test("scan over unbounded range returns all keys in sorted order", () => {
-      db.put("test_key1", "test_value1", false);
-      db.put("test_key2", "test_value2", false);
-      db.put("test_key3", "test_value3", false);
-      db.put("test_key4", "test_value4", false);
+      db.put("scan_key1", "scan_value1", false);
+      db.put("scan_key2", "scan_value2", false);
+      db.put("scan_key3", "scan_value3", false);
+      db.put("scan_key4", "scan_value4", false);
 
-      const items = db.scan();
+      const items = db.scan("scan_key1", "scan_key5");
       expect(items).toHaveLength(4);
 
       for (let i = 0; i < items.length; i++) {
         const n = i + 1;
-        expect(str(items[i].key)).toBe(`test_key${n}`);
-        expect(str(items[i].value)).toBe(`test_value${n}`);
+        expect(str(items[i].key)).toBe(`scan_key${n}`);
+        expect(str(items[i].value)).toBe(`scan_value${n}`);
       }
     });
 
     test("scan over bounded range [key1, key3) returns matching keys", () => {
-      db.put("test_key1", "test_value1", false);
-      db.put("test_key2", "test_value2", false);
-      db.put("test_key3", "test_value3", false);
-      db.put("test_key4", "test_value4", false);
-
-      const items = db.scan("test_key1", "test_key3");
+      const items = db.scan("scan_key1", "scan_key3");
       expect(items).toHaveLength(2);
-      expect(str(items[0].key)).toBe("test_key1");
-      expect(str(items[0].value)).toBe("test_value1");
-      expect(str(items[1].key)).toBe("test_key2");
-      expect(str(items[1].value)).toBe("test_value2");
+      expect(str(items[0].key)).toBe("scan_key1");
+      expect(str(items[0].value)).toBe("scan_value1");
+      expect(str(items[1].key)).toBe("scan_key2");
+      expect(str(items[1].value)).toBe("scan_value2");
     });
 
     test("scan with start bound returns keys from that point", () => {
-      db.put("test_key1", "test_value1", false);
-      db.put("test_key2", "test_value2", false);
-      db.put("test_key3", "test_value3", false);
-      db.put("test_key4", "test_value4", false);
-
-      const items = db.scan("test_key4");
+      const items = db.scan("scan_key4", "scan_key5");
       expect(items).toHaveLength(1);
-      expect(str(items[0].key)).toBe("test_key4");
-      expect(str(items[0].value)).toBe("test_value4");
+      expect(str(items[0].key)).toBe("scan_key4");
+      expect(str(items[0].value)).toBe("scan_value4");
     });
   });
 
   describe(`[${label}] write batch`, () => {
     let db: SlateDB;
 
-    beforeEach(() => {
+    beforeAll(() => {
       db = SlateDB.open(uniquePath("batch"), url);
     });
 
-    afterEach(() => {
+    afterAll(() => {
       db.close();
     });
 
@@ -142,25 +123,25 @@ for (const url of urls) {
     });
 
     test("WriteBatch with deletes", () => {
-      db.put("d1", "before", false);
-      db.put("d2", "keep", false);
+      db.put("bd1", "before", false);
+      db.put("bd2", "keep", false);
 
       const batch = new WriteBatch();
-      batch.delete("d1");
-      batch.put("d3", "new");
+      batch.delete("bd1");
+      batch.put("bd3", "new");
       db.writeBatch(batch, false);
 
-      expect(db.get("d1")).toBeNull();
-      expect(db.getString("d2")).toBe("keep");
-      expect(db.getString("d3")).toBe("new");
+      expect(db.get("bd1")).toBeNull();
+      expect(db.getString("bd2")).toBe("keep");
+      expect(db.getString("bd3")).toBe("new");
     });
 
     test("WriteBatch non-durable", () => {
       const batch = new WriteBatch();
-      batch.put("nd1", "fast");
+      batch.put("bnd1", "fast");
       db.writeBatch(batch, false);
 
-      expect(db.getString("nd1")).toBe("fast");
+      expect(db.getString("bnd1")).toBe("fast");
     });
 
     test("free unused WriteBatch without error", () => {
@@ -173,11 +154,11 @@ for (const url of urls) {
   describe(`[${label}] transactions`, () => {
     let db: SlateDB;
 
-    beforeEach(() => {
+    beforeAll(() => {
       db = SlateDB.open(uniquePath("txn"), url);
     });
 
-    afterEach(() => {
+    afterAll(() => {
       db.close();
     });
 
@@ -192,15 +173,15 @@ for (const url of urls) {
     });
 
     test("transaction rollback discards writes", () => {
-      db.put("existing", "original", false);
+      db.put("tr_existing", "original", false);
 
       const txn = db.begin();
-      txn.put("existing", "modified");
-      txn.put("new_key", "new_val");
+      txn.put("tr_existing", "modified");
+      txn.put("tr_new_key", "new_val");
       txn.rollback();
 
-      expect(db.getString("existing")).toBe("original");
-      expect(db.get("new_key")).toBeNull();
+      expect(db.getString("tr_existing")).toBe("original");
+      expect(db.get("tr_new_key")).toBeNull();
     });
 
     test("transaction read-your-writes", () => {
@@ -245,11 +226,11 @@ for (const url of urls) {
   describe(`[${label}] bridge extras`, () => {
     let db: SlateDB;
 
-    beforeEach(() => {
+    beforeAll(() => {
       db = SlateDB.open(uniquePath("extra"), url);
     });
 
-    afterEach(() => {
+    afterAll(() => {
       db.close();
     });
 
@@ -277,35 +258,35 @@ for (const url of urls) {
     });
 
     test("overwrite replaces value", () => {
-      db.put("k", "v1", false);
-      expect(db.getString("k")).toBe("v1");
-      db.put("k", "v2", false);
-      expect(db.getString("k")).toBe("v2");
+      db.put("ow_k", "v1", false);
+      expect(db.getString("ow_k")).toBe("v1");
+      db.put("ow_k", "v2", false);
+      expect(db.getString("ow_k")).toBe("v2");
     });
 
     test("delete non-existent key is a no-op", () => {
-      db.delete("ghost");
+      db.delete("ghost", false);
     });
 
-    test("scan empty database returns empty array", () => {
-      expect(db.scan()).toEqual([]);
+    test("scan empty prefix returns empty array", () => {
+      expect(db.scan("zzz_no_match", "zzz_no_match~")).toEqual([]);
     });
 
     test("flush does not lose data", () => {
-      db.put("f1", "v1", false);
+      db.put("fl1", "v1", false);
       db.flush();
-      expect(db.getString("f1")).toBe("v1");
+      expect(db.getString("fl1")).toBe("v1");
     });
 
     test("many sequential writes maintain scan order", () => {
       const n = 100;
       for (let i = 0; i < n; i++) {
-        const key = `key_${String(i).padStart(4, "0")}`;
+        const key = `seq_${String(i).padStart(4, "0")}`;
         db.put(key, `val_${i}`, false);
       }
       db.flush();
 
-      const items = db.scan();
+      const items = db.scan("seq_", "seq_~");
       expect(items).toHaveLength(n);
 
       for (let i = 1; i < items.length; i++) {
