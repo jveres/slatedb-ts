@@ -137,6 +137,37 @@ function makeKeyGen(type: string, keyLen: number, keyCount: number): KeyGenerato
 }
 
 // ---------------------------------------------------------------------------
+// Stats printers
+// ---------------------------------------------------------------------------
+function printDbStats(stats: StatsRecorder, benchStart: number) {
+  const r = stats.getRelevant();
+  if (!r) return;
+  const putRate  = (stats.sumField(r.relevant, "puts") / r.intervalS).toFixed(1);
+  const putMBs   = (stats.sumField(r.relevant, "putsBytes") / r.intervalS / 1_048_576).toFixed(3);
+  const getRate  = (stats.sumField(r.relevant, "gets") / r.intervalS).toFixed(1);
+  const getMBs   = (stats.sumField(r.relevant, "getsBytes") / r.intervalS / 1_048_576).toFixed(3);
+  const getsTotal = stats.sumField(r.relevant, "gets");
+  const hitPct   = getsTotal > 0 ? ((stats.sumField(r.relevant, "getsHits") / getsTotal) * 100).toFixed(1) : "0.0";
+  const elapsed  = ((r.rangeEnd - benchStart) / 1000).toFixed(1);
+  console.log(`[${elapsed}s] put/s: ${putRate} (${putMBs} MiB/s), get/s: ${getRate} (${getMBs} MiB/s), hit: ${hitPct}%, total puts: ${stats.total("puts")}, total gets: ${stats.total("gets")}`);
+}
+
+function printTxnStats(stats: StatsRecorder, benchStart: number) {
+  const r = stats.getRelevant();
+  if (!r) return;
+  const commitRate   = (stats.sumField(r.relevant, "commits") / r.intervalS).toFixed(1);
+  const abortRate    = (stats.sumField(r.relevant, "aborts") / r.intervalS).toFixed(1);
+  const conflictRate = (stats.sumField(r.relevant, "conflicts") / r.intervalS).toFixed(1);
+  const opsRate      = (stats.sumField(r.relevant, "totalOps") / r.intervalS).toFixed(1);
+  const totalTxns    = stats.sumField(r.relevant, "commits") + stats.sumField(r.relevant, "aborts") + stats.sumField(r.relevant, "conflicts");
+  const commitPct    = totalTxns > 0 ? ((stats.sumField(r.relevant, "commits") / totalTxns) * 100).toFixed(1) : "0.0";
+  const abortPct     = totalTxns > 0 ? ((stats.sumField(r.relevant, "aborts") / totalTxns) * 100).toFixed(1) : "0.0";
+  const conflictPct  = totalTxns > 0 ? ((stats.sumField(r.relevant, "conflicts") / totalTxns) * 100).toFixed(1) : "0.0";
+  const elapsed      = ((r.rangeEnd - benchStart) / 1000).toFixed(1);
+  console.log(`[${elapsed}s] commit/s: ${commitRate} (${commitPct}%), abort/s: ${abortRate} (${abortPct}%), conflict/s: ${conflictRate} (${conflictPct}%), ops/s: ${opsRate}, total: commits=${stats.total("commits")}, aborts=${stats.total("aborts")}, conflicts=${stats.total("conflicts")}, ops=${stats.total("totalOps")}`);
+}
+
+// ---------------------------------------------------------------------------
 // Subcommand: db — port of db.rs
 // ---------------------------------------------------------------------------
 function runDbBench(argv: string[]) {
@@ -219,6 +250,7 @@ Options:
 
     const start = performance.now();
     let lastReport = start;
+    let lastDump = start;
     let puts = 0, gets = 0, putsBytes = 0, getsBytes = 0, getsHits = 0;
 
     while (stats.total("puts") < perWorkerRows * (w + 1) && (performance.now() - start) < perWorkerDuration) {
@@ -247,22 +279,17 @@ Options:
         lastReport = now;
         stats.record(now, { puts, gets, putsBytes, getsBytes, getsHits });
         puts = gets = putsBytes = getsBytes = getsHits = 0;
+
+        // Print stats periodically (every STAT_DUMP_INTERVAL_MS)
+        if (now - lastDump >= STAT_DUMP_INTERVAL_MS) {
+          lastDump = now;
+          printDbStats(stats, benchStart);
+        }
       }
     }
 
     if (puts || gets) stats.record(performance.now(), { puts, gets, putsBytes, getsBytes, getsHits });
-
-    const r = stats.getRelevant();
-    if (r) {
-      const putRate  = (stats.sumField(r.relevant, "puts") / r.intervalS).toFixed(1);
-      const putMBs   = (stats.sumField(r.relevant, "putsBytes") / r.intervalS / 1_048_576).toFixed(3);
-      const getRate  = (stats.sumField(r.relevant, "gets") / r.intervalS).toFixed(1);
-      const getMBs   = (stats.sumField(r.relevant, "getsBytes") / r.intervalS / 1_048_576).toFixed(3);
-      const getsTotal = stats.sumField(r.relevant, "gets");
-      const hitPct   = getsTotal > 0 ? ((stats.sumField(r.relevant, "getsHits") / getsTotal) * 100).toFixed(1) : "0.0";
-      const elapsed  = ((r.rangeEnd - benchStart) / 1000).toFixed(1);
-      console.log(`[${elapsed}s] put/s: ${putRate} (${putMBs} MiB/s), get/s: ${getRate} (${getMBs} MiB/s), hit: ${hitPct}%, total puts: ${stats.total("puts")}, total gets: ${stats.total("gets")}`);
-    }
+    printDbStats(stats, benchStart);
   }
 
   const benchS = ((performance.now() - benchStart) / 1000).toFixed(1);
@@ -367,6 +394,7 @@ Options:
 
     const start = performance.now();
     let lastReport = start;
+    let lastDump = start;
     let commits = 0, aborts = 0, conflicts = 0, totalOps = 0;
 
     while ((performance.now() - start) < perWorkerDuration) {
@@ -436,28 +464,19 @@ Options:
         lastReport = now;
         stats.record(now, { commits, aborts, conflicts, totalOps });
         commits = aborts = conflicts = totalOps = 0;
+
+        // Print stats periodically (every STAT_DUMP_INTERVAL_MS)
+        if (now - lastDump >= STAT_DUMP_INTERVAL_MS) {
+          lastDump = now;
+          printTxnStats(stats, benchStart);
+        }
       }
     }
 
     if (commits || aborts || conflicts) {
       stats.record(performance.now(), { commits, aborts, conflicts, totalOps });
     }
-
-    const r = stats.getRelevant();
-    if (r) {
-      const commitRate   = (stats.sumField(r.relevant, "commits") / r.intervalS).toFixed(1);
-      const abortRate    = (stats.sumField(r.relevant, "aborts") / r.intervalS).toFixed(1);
-      const conflictRate = (stats.sumField(r.relevant, "conflicts") / r.intervalS).toFixed(1);
-      const opsRate      = (stats.sumField(r.relevant, "totalOps") / r.intervalS).toFixed(1);
-
-      const totalTxns    = stats.sumField(r.relevant, "commits") + stats.sumField(r.relevant, "aborts") + stats.sumField(r.relevant, "conflicts");
-      const commitPct    = totalTxns > 0 ? ((stats.sumField(r.relevant, "commits") / totalTxns) * 100).toFixed(1) : "0.0";
-      const abortPct     = totalTxns > 0 ? ((stats.sumField(r.relevant, "aborts") / totalTxns) * 100).toFixed(1) : "0.0";
-      const conflictPct  = totalTxns > 0 ? ((stats.sumField(r.relevant, "conflicts") / totalTxns) * 100).toFixed(1) : "0.0";
-      const elapsed      = ((r.rangeEnd - benchStart) / 1000).toFixed(1);
-
-      console.log(`[${elapsed}s] commit/s: ${commitRate} (${commitPct}%), abort/s: ${abortRate} (${abortPct}%), conflict/s: ${conflictRate} (${conflictPct}%), ops/s: ${opsRate}, total: commits=${stats.total("commits")}, aborts=${stats.total("aborts")}, conflicts=${stats.total("conflicts")}, ops=${stats.total("totalOps")}`);
-    }
+    printTxnStats(stats, benchStart);
   }
 
   const benchS = ((performance.now() - benchStart) / 1000).toFixed(1);
