@@ -427,7 +427,12 @@ bun run bencher -- transaction --isolation-level serializable
 # any backend via --url
 bun run bencher -- db --url "file:///tmp/bench"
 bun run bencher -- transaction --url "az://my-container"
+
+# tune WAL flush interval (default: ~100ms)
+bun run bencher -- db --await-durable --flush-interval 10
 ```
+
+The `--flush-interval` flag sets the WAL flush interval in milliseconds via `openWithSettings`. With `--await-durable`, every write blocks until the next flush completes — so the flush interval directly controls durable write throughput. The default (~100ms) caps throughput at ~10 flush cycles/sec regardless of backend speed. Lowering it (e.g. `--flush-interval 10`) lets faster backends like S3 Express One Zone show their latency advantage over standard S3.
 
 Shorthand scripts:
 
