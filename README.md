@@ -188,7 +188,7 @@ SLATEDB_TEST_URLS="az://my-container" bun test
 
 Every backend listed in `SLATEDB_TEST_URLS` (comma-separated) gets the full 23-test suite. Each run uses unique timestamped paths to avoid collisions on persistent stores.
 
-**Cloud backend latency:** Tests use `awaitDurable=true` (the default) to test the real durability code path. Each durable write blocks on flush interval (100ms) + object store round-trip, so cloud backends are slower than in-memory (~20-60s vs ~2s). The per-test timeout is set to 30s in `bunfig.toml` to accommodate this. SlateDB's own integration test ([`tests/db.rs`](https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs)) uses `await_durable: false` with a single `flush()` at the end for the same reason.
+**Write pattern:** Tests use `awaitDurable=false` for writes with explicit `flush()` where durability is needed. This matches SlateDB's own cloud-compatible integration test ([`tests/db.rs`](https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs)), which uses the same pattern because `awaitDurable=true` blocks the calling thread on every object store round-trip (flush interval + network latency). Non-durable writes land in the memtable immediately and are visible within the same process — no flush needed for read-after-write consistency.
 
 ## Benchmark
 

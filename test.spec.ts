@@ -5,6 +5,12 @@
  * defaulting to in-memory. Each backend gets a unique path per run to avoid
  * cross-run collisions on persistent stores.
  *
+ * All writes use `awaitDurable=false` with explicit `flush()` where needed,
+ * matching SlateDB's own cloud-compatible test pattern (tests/db.rs). This
+ * avoids blocking Bun's main thread on every S3/Azure round-trip — reads
+ * still see the data because non-durable writes land in the memtable
+ * immediately and are visible within the same process.
+ *
  * Usage:
  *   bun test                                              # in-memory only
  *   SLATEDB_TEST_URLS=":memory:,file:///tmp/slate" bun test
@@ -18,6 +24,7 @@
  *   gs://bucket     — Google Cloud  (needs GOOGLE_SERVICE_ACCOUNT)
  *
  * @see https://github.com/slatedb/slatedb/blob/main/examples/src/full_example.rs
+ * @see https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { SlateDB, WriteBatch, Transaction, IsolationLevel } from "./index";
@@ -56,12 +63,12 @@ for (const url of urls) {
     });
 
     test("put then get returns the value", () => {
-      db.put("test_key", "test_value");
+      db.put("test_key", "test_value", false);
       expect(db.getString("test_key")).toBe("test_value");
     });
 
     test("delete removes the key", () => {
-      db.put("test_key", "test_value");
+      db.put("test_key", "test_value", false);
       expect(db.getString("test_key")).toBe("test_value");
 
       db.delete("test_key");
@@ -69,10 +76,10 @@ for (const url of urls) {
     });
 
     test("scan over unbounded range returns all keys in sorted order", () => {
-      db.put("test_key1", "test_value1");
-      db.put("test_key2", "test_value2");
-      db.put("test_key3", "test_value3");
-      db.put("test_key4", "test_value4");
+      db.put("test_key1", "test_value1", false);
+      db.put("test_key2", "test_value2", false);
+      db.put("test_key3", "test_value3", false);
+      db.put("test_key4", "test_value4", false);
 
       const items = db.scan();
       expect(items).toHaveLength(4);
@@ -85,10 +92,10 @@ for (const url of urls) {
     });
 
     test("scan over bounded range [key1, key3) returns matching keys", () => {
-      db.put("test_key1", "test_value1");
-      db.put("test_key2", "test_value2");
-      db.put("test_key3", "test_value3");
-      db.put("test_key4", "test_value4");
+      db.put("test_key1", "test_value1", false);
+      db.put("test_key2", "test_value2", false);
+      db.put("test_key3", "test_value3", false);
+      db.put("test_key4", "test_value4", false);
 
       const items = db.scan("test_key1", "test_key3");
       expect(items).toHaveLength(2);
@@ -99,10 +106,10 @@ for (const url of urls) {
     });
 
     test("scan with start bound returns keys from that point", () => {
-      db.put("test_key1", "test_value1");
-      db.put("test_key2", "test_value2");
-      db.put("test_key3", "test_value3");
-      db.put("test_key4", "test_value4");
+      db.put("test_key1", "test_value1", false);
+      db.put("test_key2", "test_value2", false);
+      db.put("test_key3", "test_value3", false);
+      db.put("test_key4", "test_value4", false);
 
       const items = db.scan("test_key4");
       expect(items).toHaveLength(1);
@@ -127,7 +134,7 @@ for (const url of urls) {
       batch.put("b1", "v1");
       batch.put("b2", "v2");
       batch.put("b3", "v3");
-      db.writeBatch(batch);
+      db.writeBatch(batch, false);
 
       expect(db.getString("b1")).toBe("v1");
       expect(db.getString("b2")).toBe("v2");
@@ -135,13 +142,13 @@ for (const url of urls) {
     });
 
     test("WriteBatch with deletes", () => {
-      db.put("d1", "before");
-      db.put("d2", "keep");
+      db.put("d1", "before", false);
+      db.put("d2", "keep", false);
 
       const batch = new WriteBatch();
       batch.delete("d1");
       batch.put("d3", "new");
-      db.writeBatch(batch);
+      db.writeBatch(batch, false);
 
       expect(db.get("d1")).toBeNull();
       expect(db.getString("d2")).toBe("keep");
@@ -178,14 +185,14 @@ for (const url of urls) {
       const txn = db.begin();
       txn.put("tk1", "tv1");
       txn.put("tk2", "tv2");
-      txn.commit();
+      txn.commit(false);
 
       expect(db.getString("tk1")).toBe("tv1");
       expect(db.getString("tk2")).toBe("tv2");
     });
 
     test("transaction rollback discards writes", () => {
-      db.put("existing", "original");
+      db.put("existing", "original", false);
 
       const txn = db.begin();
       txn.put("existing", "modified");
@@ -197,23 +204,23 @@ for (const url of urls) {
     });
 
     test("transaction read-your-writes", () => {
-      db.put("ryw", "before");
+      db.put("ryw", "before", false);
 
       const txn = db.begin();
       txn.put("ryw", "inside_txn");
       expect(txn.getString("ryw")).toBe("inside_txn");
-      txn.commit();
+      txn.commit(false);
 
       expect(db.getString("ryw")).toBe("inside_txn");
     });
 
     test("transaction delete", () => {
-      db.put("td", "will_delete");
+      db.put("td", "will_delete", false);
 
       const txn = db.begin();
       txn.delete("td");
       expect(txn.get("td")).toBeNull();
-      txn.commit();
+      txn.commit(false);
 
       expect(db.get("td")).toBeNull();
     });
@@ -229,7 +236,7 @@ for (const url of urls) {
     test("transaction with SerializableSnapshot isolation", () => {
       const txn = db.begin(IsolationLevel.SerializableSnapshot);
       txn.put("iso", "serializable");
-      txn.commit();
+      txn.commit(false);
 
       expect(db.getString("iso")).toBe("serializable");
     });
@@ -249,7 +256,7 @@ for (const url of urls) {
     test("binary keys and values round-trip", () => {
       const key = new Uint8Array([0xCA, 0xFE]);
       const val = new Uint8Array([0xBE, 0xEF]);
-      db.put(key, val);
+      db.put(key, val, false);
 
       const got = db.get(key);
       expect(got).not.toBeNull();
@@ -263,16 +270,16 @@ for (const url of urls) {
     });
 
     test("put empty value", () => {
-      db.put("empty", new Uint8Array(0));
+      db.put("empty", new Uint8Array(0), false);
       const got = db.get("empty");
       expect(got).not.toBeNull();
       expect(got!.byteLength).toBe(0);
     });
 
     test("overwrite replaces value", () => {
-      db.put("k", "v1");
+      db.put("k", "v1", false);
       expect(db.getString("k")).toBe("v1");
-      db.put("k", "v2");
+      db.put("k", "v2", false);
       expect(db.getString("k")).toBe("v2");
     });
 
@@ -285,7 +292,7 @@ for (const url of urls) {
     });
 
     test("flush does not lose data", () => {
-      db.put("f1", "v1");
+      db.put("f1", "v1", false);
       db.flush();
       expect(db.getString("f1")).toBe("v1");
     });
@@ -294,7 +301,7 @@ for (const url of urls) {
       const n = 100;
       for (let i = 0; i < n; i++) {
         const key = `key_${String(i).padStart(4, "0")}`;
-        db.put(key, `val_${i}`, /* awaitDurable */ false);
+        db.put(key, `val_${i}`, false);
       }
       db.flush();
 
