@@ -46,18 +46,11 @@ for (const url of urls) {
     let db: SlateDB;
 
     beforeAll(() => {
-      const path = uniquePath("full");
-      console.log(`    ⏳ opening ${label} (${path})...`);
-      const t = performance.now();
-      db = SlateDB.open(path, url);
-      console.log(`    ✓ opened in ${(performance.now() - t).toFixed(0)}ms`);
+      db = SlateDB.open(uniquePath("full"), url);
     });
 
     afterAll(() => {
-      console.log(`    ⏳ closing...`);
-      const t = performance.now();
       db.close();
-      console.log(`    ✓ closed in ${(performance.now() - t).toFixed(0)}ms`);
     });
 
     test("put then get returns the value", () => {

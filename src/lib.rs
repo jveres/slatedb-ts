@@ -1,7 +1,6 @@
 use object_store::memory::InMemory;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
-use object_store::prefix::PrefixStore;
 use once_cell::sync::Lazy;
 use slatedb::config::{PutOptions, WriteOptions};
 use slatedb::{Db, DbTransaction, IsolationLevel, WriteBatch};
@@ -91,27 +90,21 @@ fn resolve_store(url: *const c_char) -> Arc<dyn ObjectStore> {
 // ===========================================================================
 
 /// Open a database. Returns opaque handle (null on error).
-/// Times out after 30 seconds to avoid hanging on unreachable object stores.
+/// Times out after 30 seconds to avoid hanging on misconfigured object stores.
 #[no_mangle]
 pub extern "C" fn slatedb_open(path: *const c_char, url: *const c_char) -> *mut DbHandle {
     let p = cstr_to_str(path);
-    let u = cstr_to_str(url);
-    eprintln!("[ffi] resolving store for '{u}'...");
     let store = resolve_store(url);
-    eprintln!("[ffi] store resolved, opening db at '{p}'...");
     match RT.block_on(async {
         tokio::time::timeout(Duration::from_secs(30), Db::open(p, store)).await
     }) {
-        Ok(Ok(db)) => {
-            eprintln!("[ffi] db opened successfully");
-            Box::into_raw(Box::new(DbHandle { db }))
-        }
+        Ok(Ok(db)) => Box::into_raw(Box::new(DbHandle { db })),
         Ok(Err(e)) => {
-            eprintln!("[ffi] slatedb_open FAILED: {e}");
+            eprintln!("slatedb_open: {e}");
             ptr::null_mut()
         }
         Err(_) => {
-            eprintln!("[ffi] slatedb_open TIMED OUT after 30s — check credentials, region, and bucket access");
+            eprintln!("slatedb_open: timed out after 30s — check credentials, region, and bucket access");
             ptr::null_mut()
         }
     }
