@@ -146,6 +146,21 @@ function cloudWarning(url: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Flush + close with progress dots
+// ---------------------------------------------------------------------------
+async function flushAndClose(db: InstanceType<typeof SlateDB>) {
+  process.stdout.write("Flushing... ");
+  const t0 = performance.now();
+  const dots = setInterval(() => process.stdout.write("."), 1_000);
+  await db.flush();
+  clearInterval(dots);
+  process.stdout.write(` ${(performance.now() - t0).toFixed(0)}ms. Closing... `);
+  const t1 = performance.now();
+  await db.close();
+  console.log(`${(performance.now() - t1).toFixed(0)}ms.`);
+}
+
+// ---------------------------------------------------------------------------
 // Stats printers
 // ---------------------------------------------------------------------------
 function printDbStats(stats: StatsRecorder, benchStart: number) {
@@ -306,15 +321,7 @@ Options:
   const benchS = ((performance.now() - benchStart) / 1000).toFixed(1);
   console.log(`\nBench done in ${benchS}s — total puts: ${stats.total("puts")}, total gets: ${stats.total("gets")}`);
 
-  process.stdout.write("Flushing... ");
-  const t0 = performance.now();
-  await db.flush();
-  const flushMs = (performance.now() - t0).toFixed(0);
-  process.stdout.write(`${flushMs}ms. Closing... `);
-  const t1 = performance.now();
-  await db.close();
-  const closeMs = (performance.now() - t1).toFixed(0);
-  console.log(`${closeMs}ms.`);
+  await flushAndClose(db);
 }
 
 // ---------------------------------------------------------------------------
@@ -494,15 +501,7 @@ Options:
   const benchS = ((performance.now() - benchStart) / 1000).toFixed(1);
   console.log(`\nBench done in ${benchS}s — commits: ${stats.total("commits")}, aborts: ${stats.total("aborts")}, conflicts: ${stats.total("conflicts")}, ops: ${stats.total("totalOps")}`);
 
-  process.stdout.write("Flushing... ");
-  const t0b = performance.now();
-  await db.flush();
-  const flushMsB = (performance.now() - t0b).toFixed(0);
-  process.stdout.write(`${flushMsB}ms. Closing... `);
-  const t1b = performance.now();
-  await db.close();
-  const closeMsB = (performance.now() - t1b).toFixed(0);
-  console.log(`${closeMsB}ms.`);
+  await flushAndClose(db);
 }
 
 // ---------------------------------------------------------------------------
