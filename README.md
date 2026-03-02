@@ -49,6 +49,12 @@ const db2 = await SlateDB.open("/my-db", ":memory:", {
   mergeOperator: "uint64_add",
 });
 
+// Open in read-only mode (multiple readers allowed, no fencing)
+const reader = await SlateDB.open("/my-db", "s3://my-bucket", { readOnly: true });
+const val2 = await reader.getString(Buffer.from("hello"));
+const items2 = await reader.scanPrefix(Buffer.from("user:"));
+await reader.close();
+
 // Put / Get
 await db.put(Buffer.from("hello"), Buffer.from("world"));
 const val = await db.getString(Buffer.from("hello")); // "world"
@@ -169,8 +175,11 @@ type Settings = {
   maxUnflushedBytes?: number;  // Max unflushed bytes before writer backpressure
   defaultTtlMs?: number;       // Default TTL for put operations (null = no expiry)
   mergeOperator?: string;      // "string_concat" or "uint64_add" (null = no merge)
+  readOnly?: boolean;          // Open as read-only reader (default: false)
 };
 ```
+
+When `readOnly` is true, the database opens as a `DbReader` — a read-only client that doesn't fence writers. Multiple readers can access the same DB path concurrently alongside a single writer. Write operations (`put`, `delete`, `merge`, `flush`, `writeBatch`, `begin`, `snapshot`, `createCheckpoint`) throw with "operation not supported in read-only mode".
 
 > **Coming from the Rust `slatedb-bencher`?** The Rust CLI uses the older `admin::load_object_store_from_env()` API which reads a `CLOUD_PROVIDER` env var. This bridge uses URL strings instead — the mapping is:
 >
@@ -341,7 +350,7 @@ Compaction is **fully automatic**. When `SlateDB.open()` is called, SlateDB spaw
 
 ## Test
 
-Integration tests are organized in 13 groups — 49 tests total:
+Integration tests are organized in 14 groups — 52 tests total:
 
 | Group                   | Tests | Description                                                    |
 | ----------------------- | ----: | -------------------------------------------------------------- |
@@ -360,6 +369,7 @@ Integration tests are organized in 13 groups — 49 tests total:
 | **checkpoint**          |     2 | Create with defaults, create with name and lifetime            |
 | **open with settings**  |     2 | Custom settings, unknown merge operator error                  |
 | **getString**           |     3 | DB getString, missing key, transaction getString               |
+| **read-only mode**     |     3 | Reader get/scan, write throws (skipped on `:memory:`)          |
 
 ```bash
 # In-memory (default)
@@ -381,7 +391,7 @@ SLATEDB_TEST_URLS="s3://my-r2-bucket" bun test
 SLATEDB_TEST_URLS="az://my-container" bun test
 ```
 
-Every backend listed in `SLATEDB_TEST_URLS` (comma-separated) gets the full 49-test suite. Each run uses unique timestamped paths to avoid collisions on persistent stores.
+Every backend listed in `SLATEDB_TEST_URLS` (comma-separated) gets the full 52-test suite. Each run uses unique timestamped paths to avoid collisions on persistent stores.
 
 ## Benchmark
 
@@ -483,7 +493,7 @@ All async Rust futures are automatically converted to JS Promises by napi-rs. Th
 ├── bunfig.toml        Bun config — 30s test timeout for cloud backends
 ├── src/lib.rs         napi-rs native classes (SlateDB, WriteBatch, Transaction, Snapshot)
 ├── index.ts           Native module loader + re-exports
-├── test.spec.ts       Integration tests — 49 tests across 13 groups, multi-backend
+├── test.spec.ts       Integration tests — 52 tests across 14 groups, multi-backend
 ├── bench.ts           Micro-benchmark — comparison against SlateDB's Criterion bench
 ├── bencher.ts         Sustained throughput — ported from slatedb-bencher (db + transaction)
 ├── package.json       Scripts: build, test, bench, bencher, bencher:db, bencher:txn

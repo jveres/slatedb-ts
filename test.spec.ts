@@ -670,4 +670,61 @@ for (const url of urls) {
       await txn.rollback();
     });
   });
+
+  // =========================================================================
+  // read-only mode (requires persistent backend — skipped for :memory:)
+  // =========================================================================
+  const skipReadOnly = url === ":memory:";
+  describe(`[${label}] read-only mode`, () => {
+    test.skipIf(skipReadOnly)("reader can read data written by writer", async () => {
+      const dbPath = uniquePath("ro");
+      const writer = await SlateDB.open(dbPath, url);
+      await writer.put(Buffer.from("ro_k1"), Buffer.from("v1"));
+      await writer.put(Buffer.from("ro_k2"), Buffer.from("v2"));
+      await writer.flush();
+      await writer.close();
+
+      const reader = await SlateDB.open(dbPath, url, { readOnly: true });
+      expect(await reader.getString(Buffer.from("ro_k1"))).toBe("v1");
+      expect(await reader.getString(Buffer.from("ro_k2"))).toBe("v2");
+      expect(await reader.get(Buffer.from("ro_missing"))).toBeNull();
+      await reader.close();
+    });
+
+    test.skipIf(skipReadOnly)("reader scan and scanPrefix work", async () => {
+      const dbPath = uniquePath("ro_scan");
+      const writer = await SlateDB.open(dbPath, url);
+      await writer.put(Buffer.from("rs:a"), Buffer.from("1"));
+      await writer.put(Buffer.from("rs:b"), Buffer.from("2"));
+      await writer.put(Buffer.from("rs:c"), Buffer.from("3"));
+      await writer.flush();
+      await writer.close();
+
+      const reader = await SlateDB.open(dbPath, url, { readOnly: true });
+      const all = await reader.scan(Buffer.from("rs:"), Buffer.from("rs:~"));
+      expect(all).toHaveLength(3);
+
+      const prefixed = await reader.scanPrefix(Buffer.from("rs:"));
+      expect(prefixed).toHaveLength(3);
+      expect(str(prefixed[0].key)).toBe("rs:a");
+      await reader.close();
+    });
+
+    test.skipIf(skipReadOnly)("write operations throw in read-only mode", async () => {
+      const dbPath = uniquePath("ro_write");
+      const writer = await SlateDB.open(dbPath, url);
+      await writer.put(Buffer.from("x"), Buffer.from("y"));
+      await writer.flush();
+      await writer.close();
+
+      const reader = await SlateDB.open(dbPath, url, { readOnly: true });
+      try {
+        await reader.put(Buffer.from("a"), Buffer.from("b"));
+        expect(true).toBe(false); // should not reach
+      } catch (e: any) {
+        expect(e.message).toContain("read-only");
+      }
+      await reader.close();
+    });
+  });
 }

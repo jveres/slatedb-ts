@@ -74,6 +74,7 @@ export type Settings = {
   maxUnflushedBytes?: number;
   defaultTtlMs?: number;
   mergeOperator?: "string_concat" | "uint64_add";
+  readOnly?: boolean;
 };
 
 export type CheckpointResult = {
