@@ -137,6 +137,15 @@ function makeKeyGen(type: string, keyLen: number, keyCount: number): KeyGenerato
 }
 
 // ---------------------------------------------------------------------------
+// Cloud warning
+// ---------------------------------------------------------------------------
+function cloudWarning(url: string) {
+  if (/^(s3|az|gs):\/\//.test(url)) {
+    console.log(`\n  ⚠ Cloud backend — if the run stalls, reduce --val-len or --put-percentage`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Stats printers
 // ---------------------------------------------------------------------------
 function printDbStats(stats: StatsRecorder, benchStart: number) {
@@ -236,9 +245,7 @@ Options:
   console.log(`  await-durable:    ${AWAIT_DURABLE}`);
   console.log(`  key-generator:    ${KEY_GEN}`);
 
-  if (/^(s3|az|gs):\/\//.test(args.url!)) {
-    console.log(`\n  ⚠ Cloud backend — if the run stalls, reduce --val-len or --put-percentage`);
-  }
+  cloudWarning(args.url!);
   console.log();
 
   const ts = Date.now();
@@ -384,6 +391,7 @@ Options:
   console.log(`  isolation:        ${args["isolation-level"]}`);
   console.log(`  await-durable:    ${AWAIT_DURABLE}`);
   console.log(`  key-generator:    ${KEY_GEN}`);
+  cloudWarning(args.url!);
   console.log();
 
   const ts = Date.now();
