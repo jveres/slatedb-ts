@@ -32,12 +32,22 @@ cargo build --release --no-default-features --features moka
 ## Usage
 
 ```typescript
-import { SlateDB, WriteBatch, Transaction, IsolationLevel } from "./index";
+import {
+  SlateDB, WriteBatch, IsolationLevel,
+  DurabilityLevel, FlushType, CheckpointScope,
+} from "./index";
 
 // Open — in-memory, local filesystem, or cloud
 const db = await SlateDB.open("/my-db", ":memory:");
 // const db = await SlateDB.open("/my-db", "file:///tmp/slate");
 // const db = await SlateDB.open("/my-db", "s3://my-bucket");
+
+// Open with custom settings
+const db2 = await SlateDB.openWithSettings("/my-db", ":memory:", {
+  flushIntervalMs: 100,
+  l0SstSizeBytes: 64 * 1024 * 1024,
+  mergeOperator: "uint64_add",
+});
 
 // Put / Get — all async, never blocks the main thread
 await db.put(Buffer.from("hello"), Buffer.from("world"));
@@ -50,11 +60,17 @@ const got = await db.get(Buffer.from([1, 2])); // Buffer [3, 4]
 // Fire-and-forget writes (skip durability wait)
 await db.put(Buffer.from("fast"), Buffer.from("write"), false);
 
+// Put with TTL (milliseconds)
+await db.put(Buffer.from("temp"), Buffer.from("expires"), true, 60000);
+
 // Range scan [start, end)
-const items = await db.scan(Buffer.from("a"), Buffer.from("z")); // KeyValue[]
+const items = await db.scan(Buffer.from("a"), Buffer.from("z"));
 
 // Full scan
 const all = await db.scan();
+
+// Prefix scan
+const users = await db.scanPrefix(Buffer.from("user:"));
 
 // Write batch — atomic multi-put
 const batch = new WriteBatch();
@@ -63,27 +79,46 @@ await batch.put(Buffer.from("k2"), Buffer.from("v2"));
 await batch.delete(Buffer.from("old"));
 await db.writeBatch(batch);
 
+// Merge — requires mergeOperator in openWithSettings
+await db2.merge(Buffer.from("counter"), Buffer.from([5, 0, 0, 0, 0, 0, 0, 0]));
+
 // Transaction — ACID with conflict detection
 const txn = await db.begin(IsolationLevel.Snapshot);
 await txn.put(Buffer.from("account_a"), Buffer.from("900"));
 await txn.put(Buffer.from("account_b"), Buffer.from("1100"));
 const balance = await txn.getString(Buffer.from("account_a")); // read-your-writes
+const txnItems = await txn.scan(Buffer.from("account_"), Buffer.from("account_~"));
 await txn.commit();
-// await txn.rollback();  // or abort
 
-// Delete, flush, close
-await db.delete(Buffer.from("hello"));
-await db.flush();
+// Snapshot — read-only point-in-time view
+const snap = await db.snapshot();
+const snapVal = await snap.get(Buffer.from("hello"));
+const snapItems = await snap.scanPrefix(Buffer.from("user:"));
+
+// Checkpoint — backup/restore
+const cp = await db.createCheckpoint(CheckpointScope.All, 3600000, "daily-backup");
+console.log(cp.id, cp.manifestId);
+
+// Metrics
+const metrics = db.metrics(); // [{ name: "...", value: 42 }, ...]
+
+// Flush, close
+await db.flush(FlushType.Wal);
 await db.close();
+await db2.close();
 ```
 
 ## API
 
 All operations are **async** and return Promises. The main thread is never blocked — backpressure from cloud backends (S3 flush) is handled by the Tokio runtime on background threads.
 
-### `await SlateDB.open(path, url?)`
+---
 
-Open a database. `path` is the logical key prefix inside the store. `url` selects the backend (defaults to `":memory:"`).
+### Opening
+
+#### `await SlateDB.open(path, url?)`
+
+Open a database with default settings. `path` is the logical key prefix inside the store. `url` selects the backend (defaults to `":memory:"`).
 
 | URL scheme       | Backend              | Required env vars                                                              |
 | ---------------- | -------------------- | ------------------------------------------------------------------------------ |
@@ -95,7 +130,7 @@ Open a database. `path` is the logical key prefix inside the store. `url` select
 | `az://container` | Azure Blob Storage   | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY`                      |
 | `gs://bucket`    | Google Cloud Storage | `GOOGLE_SERVICE_ACCOUNT`                                                       |
 
-For S3-compatible backends (AWS, R2, MinIO), credentials are loaded via [`AmazonS3Builder::from_env()`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env) with `S3ConditionalPut::ETagMatch` (required for SlateDB's manifest fencing). R2 and MinIO support ETag-based conditional puts. For other backends, URL resolution is handled by the Rust [`object_store`](https://docs.rs/object_store) crate. `open()` has a 30-second timeout to prevent hanging on misconfigured backends.
+For S3-compatible backends (AWS, R2, MinIO), credentials are loaded via [`AmazonS3Builder::from_env()`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env) with `S3ConditionalPut::ETagMatch` (required for SlateDB's manifest fencing). `open()` has a 30-second timeout to prevent hanging on misconfigured backends.
 
 **Cloudflare R2 example:**
 
@@ -108,6 +143,21 @@ export AWS_REGION="auto"
 SLATEDB_TEST_URLS="s3://my-r2-bucket" bun test
 ```
 
+#### `await SlateDB.openWithSettings(path, url, settings)`
+
+Open with custom configuration:
+
+```typescript
+type Settings = {
+  flushIntervalMs?: number;    // WAL flush interval (null = disable auto-flush)
+  l0SstSizeBytes?: number;     // Min memtable size before flush to L0
+  l0MaxSsts?: number;          // Max L0 SSTs before backpressure
+  maxUnflushedBytes?: number;  // Max unflushed bytes before writer backpressure
+  defaultTtlMs?: number;       // Default TTL for put operations (null = no expiry)
+  mergeOperator?: string;      // "string_concat" or "uint64_add" (null = no merge)
+};
+```
+
 > **Coming from the Rust `slatedb-bencher`?** The Rust CLI uses the older `admin::load_object_store_from_env()` API which reads a `CLOUD_PROVIDER` env var. This bridge uses URL strings instead — the mapping is:
 >
 > | Rust `CLOUD_PROVIDER`                        | Bridge `url`                                                 |
@@ -118,67 +168,157 @@ SLATEDB_TEST_URLS="s3://my-r2-bucket" bun test
 > | `CLOUD_PROVIDER=azure` + `AZURE_*` env vars  | `"az://container"` + same `AZURE_*` env vars                 |
 > | _(not supported)_                             | `"s3://bucket"` + `AWS_ENDPOINT` for R2/MinIO/S3-compatible  |
 
-### `await db.put(key, value, awaitDurable?)`
+---
+
+### Key-Value Operations
+
+#### `await db.put(key, value, awaitDurable?, ttl?)`
 
 Insert or update. Keys and values are `Buffer`.
 
-`awaitDurable` (default `true`) controls whether to wait for persistence to object storage. Pass `false` for lower-latency fire-and-forget writes — data is still buffered in-memory and flushed on the next flush interval or explicit `flush()` call.
+- `awaitDurable` (default `true`) — wait for persistence to object storage. Pass `false` for fire-and-forget.
+- `ttl` (optional, milliseconds) — per-key time-to-live. Pass `0` for no expiry. Omit to use the default TTL from settings.
 
-### `await db.get(key)` → `Buffer | null`
+#### `await db.get(key, durabilityLevel?)` → `Buffer | null`
 
 Get raw bytes. Returns `null` if not found.
 
-### `await db.getString(key)` → `string | null`
+- `durabilityLevel` (optional) — `DurabilityLevel.Memory` (default, includes unflushed data) or `DurabilityLevel.Remote` (only durably stored data).
+
+#### `await db.getString(key, durabilityLevel?)` → `string | null`
 
 Convenience — decodes the value as UTF-8.
 
-### `await db.delete(key, awaitDurable?)`
+#### `await db.delete(key, awaitDurable?)`
 
-Delete a key. `awaitDurable` defaults to `true` (same semantics as `put`).
+Delete a key. `awaitDurable` defaults to `true`.
 
-### `await db.scan(start?, end?)` → `KeyValue[]`
+#### `await db.merge(key, value, awaitDurable?, ttl?)`
 
-Range scan `[start, end)`. Omit both for a full scan. Returns an array of `{ key: Buffer, value: Buffer }`.
+Merge a value using the configured merge operator. Requires `mergeOperator` to be set via `openWithSettings`. The merge operator combines the existing value with the new value at read time.
 
-### `await db.writeBatch(batch, awaitDurable?)`
+Built-in operators:
+- **`"string_concat"`** — appends bytes (useful for strings)
+- **`"uint64_add"`** — adds 8-byte LE unsigned integers (useful for counters)
+
+---
+
+### Scanning
+
+#### `await db.scan(start?, end?, durabilityLevel?, readAheadBytes?, maxFetchTasks?)` → `KeyValue[]`
+
+Range scan `[start, end)`. Omit both for a full scan. Returns `{ key: Buffer, value: Buffer }[]`.
+
+Optional scan parameters:
+- `durabilityLevel` — filter by durability level
+- `readAheadBytes` — bytes to read ahead (rounded up to nearest block size)
+- `maxFetchTasks` — max concurrent block fetch tasks
+
+#### `await db.scanPrefix(prefix, durabilityLevel?, readAheadBytes?, maxFetchTasks?)` → `KeyValue[]`
+
+Prefix scan — returns all keys starting with the given prefix, in sorted order.
+
+---
+
+### Write Batch
+
+#### `new WriteBatch()`
+
+Create a batch for atomic multi-put.
+
+| Method | Description |
+| --- | --- |
+| `await batch.put(key, value, ttl?)` | Add a put (with optional TTL in ms) |
+| `await batch.merge(key, value, ttl?)` | Add a merge (with optional TTL in ms) |
+| `await batch.delete(key)` | Add a delete |
+| `await batch.free()` | Discard without writing |
+
+#### `await db.writeBatch(batch, awaitDurable?)`
 
 Atomically apply a `WriteBatch`. The batch is consumed and cannot be reused.
 
-### `new WriteBatch()`
+---
 
-Create a batch. Chain `await batch.put(key, value)` and `await batch.delete(key)` calls. Submit with `await db.writeBatch(batch)`. Call `await batch.free()` to discard without writing.
+### Transactions
 
-### `await db.begin(isolation?)`
+#### `await db.begin(isolation?)`
 
 Begin an ACID transaction. Returns a `Transaction` object.
 
-`isolation` defaults to `IsolationLevel.Snapshot` (write-write conflict detection). Pass `IsolationLevel.SerializableSnapshot` for read-write + write-write conflict detection.
+- `IsolationLevel.Snapshot` (default) — write-write conflict detection
+- `IsolationLevel.SerializableSnapshot` — read-write + write-write conflict detection
 
-### Transaction methods
+| Method | Description |
+| --- | --- |
+| `await txn.put(key, value, ttl?)` | Put within the transaction (with optional TTL) |
+| `await txn.get(key, durabilityLevel?)` | Read within the transaction (sees own writes) |
+| `await txn.getString(key, durabilityLevel?)` | Read as UTF-8 string |
+| `await txn.delete(key)` | Delete within the transaction |
+| `await txn.merge(key, value, ttl?)` | Merge within the transaction |
+| `await txn.scan(start?, end?, durabilityLevel?)` | Range scan within the transaction |
+| `await txn.scanPrefix(prefix, durabilityLevel?)` | Prefix scan within the transaction |
+| `await txn.commit(awaitDurable?)` | Commit (throws on conflict) |
+| `await txn.rollback()` | Abort the transaction |
 
-| Method                            | Description                                   |
-| --------------------------------- | --------------------------------------------- |
-| `await txn.put(key, value)`       | Put within the transaction                    |
-| `await txn.get(key)`              | Read within the transaction (sees own writes) |
-| `await txn.getString(key)`        | Read as UTF-8 string                          |
-| `await txn.delete(key)`           | Delete within the transaction                 |
-| `await txn.commit(awaitDurable?)` | Commit (throws on conflict)                   |
-| `await txn.rollback()`            | Abort the transaction                         |
+---
 
-### `await db.flush()`
+### Snapshots
 
-Force-flush the memtable to object storage.
+#### `await db.snapshot()`
 
-### `await db.close()`
+Create a read-only point-in-time view. Subsequent writes to the database are not visible through the snapshot.
 
-Close the database and free native resources.
+| Method | Description |
+| --- | --- |
+| `await snap.get(key, durabilityLevel?)` | Get from the snapshot |
+| `await snap.getString(key, durabilityLevel?)` | Get as UTF-8 string |
+| `await snap.scan(start?, end?, durabilityLevel?, readAheadBytes?, maxFetchTasks?)` | Range scan |
+| `await snap.scanPrefix(prefix, durabilityLevel?, readAheadBytes?, maxFetchTasks?)` | Prefix scan |
+
+---
+
+### Checkpoints
+
+#### `await db.createCheckpoint(scope?, lifetimeMs?, name?)`
+
+Create a checkpoint for backup/restore. Returns `{ id: string, manifestId: number }`.
+
+- `scope` — `CheckpointScope.All` (default, flushes all data first) or `CheckpointScope.Durable` (only already-durable data, faster)
+- `lifetimeMs` — optional checkpoint lifetime in milliseconds (null = no expiry)
+- `name` — optional human-readable name
+
+---
+
+### Metrics
+
+#### `db.metrics()` → `Metric[]`
+
+Get runtime statistics as an array of `{ name: string, value: number }`. Includes counters for memtable operations, SST writes, compaction, cache hits/misses, etc.
+
+---
+
+### Flush & Close
+
+#### `await db.flush(flushType?)`
+
+Force-flush to object storage.
+
+- `FlushType.Wal` (default) — flush the write-ahead log
+- `FlushType.MemTable` — flush the memtable directly to L0
+
+#### `await db.close()`
+
+Close the database and free native resources. Flushes pending data before closing.
+
+---
 
 ### Exports
 
 ```typescript
-export { SlateDB, WriteBatch, Transaction, IsolationLevel };
+export { SlateDB, WriteBatch, Transaction, Snapshot, IsolationLevel,
+         DurabilityLevel, FlushType, CheckpointScope };
 export default SlateDB;
-export type { KeyValue }; // { key: Buffer, value: Buffer }
+export type { KeyValue, Settings, CheckpointResult, Metric };
 ```
 
 ## Compaction
@@ -187,14 +327,25 @@ Compaction is **fully automatic**. When `SlateDB.open()` is called, SlateDB spaw
 
 ## Test
 
-Integration tests are organized in 4 groups — 23 tests total:
+Integration tests are organized in 13 groups — 49 tests total:
 
-| Group               | Tests | Ported from                                                                                                           |
-| ------------------- | ----- | --------------------------------------------------------------------------------------------------------------------- |
-| **full_example.rs** | 5     | SlateDB's [`examples/src/full_example.rs`](https://github.com/slatedb/slatedb/blob/main/examples/src/full_example.rs) |
-| **write batch**     | 4     | atomic multi-put, deletes, non-durable, free-without-write                                                            |
-| **transactions**    | 6     | commit, rollback, read-your-writes, delete, non-durable, serializable isolation                                       |
-| **bridge extras**   | 8     | binary keys, empty values, overwrite, scan order, edge cases                                                          |
+| Group                   | Tests | Description                                                    |
+| ----------------------- | ----: | -------------------------------------------------------------- |
+| **full_example.rs**     |     5 | Ported from SlateDB's [`examples/src/full_example.rs`](https://github.com/slatedb/slatedb/blob/main/examples/src/full_example.rs) |
+| **write batch**         |     4 | Atomic multi-put, deletes, non-durable, free-without-write     |
+| **transactions**        |     6 | Commit, rollback, read-your-writes, delete, isolation          |
+| **bridge extras**       |     8 | Binary keys, empty values, overwrite, scan order, edge cases   |
+| **scan_prefix**         |     3 | Prefix scan, no matches, different prefixes                    |
+| **snapshot**            |     4 | Point-in-time reads, snapshot scan, scanPrefix, getString      |
+| **merge — string_concat** |  3 | Concatenation, create on merge, multiple merges                |
+| **merge — uint64_add**    |  2 | Counter addition, create from zero                             |
+| **WriteBatch merge**    |     1 | Merge operations in batches                                    |
+| **transaction scan**    |     3 | Transaction scan, scanPrefix, merge within transactions        |
+| **flush options**       |     2 | FlushType.Wal and FlushType.MemTable                           |
+| **metrics**             |     1 | Runtime stats shape validation                                 |
+| **checkpoint**          |     2 | Create with defaults, create with name and lifetime            |
+| **openWithSettings**    |     2 | Custom settings, unknown merge operator error                  |
+| **getString**           |     3 | DB getString, missing key, transaction getString               |
 
 ```bash
 # In-memory (default)
@@ -209,16 +360,14 @@ SLATEDB_TEST_URLS=":memory:,file:///tmp/slate" bun test
 # AWS S3
 SLATEDB_TEST_URLS="s3://my-bucket" bun test
 
-# Cloudflare R2 (set AWS_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION=auto)
+# Cloudflare R2
 SLATEDB_TEST_URLS="s3://my-r2-bucket" bun test
 
 # Azure Blob Storage
 SLATEDB_TEST_URLS="az://my-container" bun test
 ```
 
-Every backend listed in `SLATEDB_TEST_URLS` (comma-separated) gets the full 23-test suite. Each run uses unique timestamped paths to avoid collisions on persistent stores.
-
-**Cloud backend design:** Tests share one DB per group (`beforeAll`/`afterAll`) to minimize object store round-trips — `open()` and `close()` each perform multiple S3 operations (manifest, fencing, flush). All writes use `awaitDurable=false` with explicit `flush()` where needed. This matches SlateDB's own cloud-compatible integration test ([`tests/db.rs`](https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs)). Non-durable writes land in the memtable immediately and are visible within the same process — no flush needed for read-after-write consistency.
+Every backend listed in `SLATEDB_TEST_URLS` (comma-separated) gets the full 49-test suite. Each run uses unique timestamped paths to avoid collisions on persistent stores.
 
 ## Benchmark
 
@@ -273,7 +422,7 @@ bun run bencher:db                                      # = bencher.ts db
 bun run bencher:txn                                     # = bencher.ts transaction
 ```
 
-> **Note:** The `compaction` subcommand is not ported — it requires `CompactionExecuteBench`, an internal Rust struct that directly manipulates SSTs for synthetic benchmarking. It is not part of the normal database workflow (see [Compaction](#compaction)).
+> **Note:** The `compaction` subcommand is not ported — it requires `CompactionExecuteBench`, an internal Rust struct that directly manipulates SSTs for synthetic benchmarking.
 
 ## Architecture
 
@@ -284,11 +433,12 @@ bun run bencher:txn                                     # = bencher.ts transacti
 └─────────────┘                └──────────────────┘     └────────────────┘
   SlateDB                       #[napi] classes:           Db, DbTransaction,
   WriteBatch                     SlateDB                   WriteBatch,
-  Transaction                    JsWriteBatch              IsolationLevel
-  IsolationLevel                 JsTransaction
-                                                                │
-                                 async fn → Promise        object_store
-                                 Tokio runtime (napi-rs)         │
+  Transaction                    JsWriteBatch              DbSnapshot,
+  Snapshot                       JsTransaction             IsolationLevel
+  IsolationLevel                 JsSnapshot
+  DurabilityLevel                                               │
+  FlushType                      async fn → Promise        object_store
+  CheckpointScope                Tokio runtime (napi-rs)         │
                                                     ┌──────────────────────┐
                                                     │ S3 / R2 / Azure /    │
                                                     │ GCS / FS / Memory    │
@@ -297,11 +447,12 @@ bun run bencher:txn                                     # = bencher.ts transacti
 
 The Rust layer (`src/lib.rs`) exposes native JS classes via napi-rs `#[napi]` macros:
 
-| Class             | Methods                                            | Purpose                     |
-| ----------------- | -------------------------------------------------- | --------------------------- |
-| **SlateDB**       | `open`, `close`, `put`, `get`, `getString`, `delete`, `flush`, `scan`, `writeBatch`, `begin` | Database lifecycle + KV ops |
-| **WriteBatch**    | `new`, `put`, `delete`, `free`                     | Atomic batch writes         |
-| **Transaction**   | `put`, `get`, `getString`, `delete`, `commit`, `rollback` | ACID transactions           |
+| Class             | Methods                                                                         | Purpose                    |
+| ----------------- | ------------------------------------------------------------------------------- | -------------------------- |
+| **SlateDB**       | `open`, `openWithSettings`, `close`, `put`, `get`, `getString`, `delete`, `merge`, `flush`, `scan`, `scanPrefix`, `writeBatch`, `begin`, `snapshot`, `createCheckpoint`, `metrics` | Database lifecycle + all ops |
+| **WriteBatch**    | `new`, `put`, `merge`, `delete`, `free`                                         | Atomic batch writes        |
+| **Transaction**   | `put`, `get`, `getString`, `delete`, `merge`, `scan`, `scanPrefix`, `commit`, `rollback` | ACID transactions          |
+| **Snapshot**      | `get`, `getString`, `scan`, `scanPrefix`                                        | Read-only point-in-time    |
 
 All async Rust futures are automatically converted to JS Promises by napi-rs. The Tokio runtime is managed internally — no manual `block_on` calls, no main-thread blocking. Backpressure from cloud backends (S3 flush waits) is handled entirely on background threads.
 
@@ -311,9 +462,9 @@ All async Rust futures are automatically converted to JS Promises by napi-rs. Th
 ├── Cargo.toml         Rust crate — napi-rs + slatedb + object_store (aws, azure)
 ├── build.rs           napi-build setup
 ├── bunfig.toml        Bun config — 30s test timeout for cloud backends
-├── src/lib.rs         napi-rs native classes — SlateDB, WriteBatch, Transaction
+├── src/lib.rs         napi-rs native classes (SlateDB, WriteBatch, Transaction, Snapshot)
 ├── index.ts           Native module loader + re-exports
-├── test.spec.ts       Integration tests — 23 tests across 4 groups, multi-backend
+├── test.spec.ts       Integration tests — 49 tests across 13 groups, multi-backend
 ├── bench.ts           Micro-benchmark — comparison against SlateDB's Criterion bench
 ├── bencher.ts         Sustained throughput — ported from slatedb-bencher (db + transaction)
 ├── package.json       Scripts: build, test, bench, bencher, bencher:db, bencher:txn
