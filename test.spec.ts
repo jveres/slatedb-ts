@@ -8,7 +8,14 @@
  * @see https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs
  */
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { SlateDB, WriteBatch, IsolationLevel } from "./index";
+import {
+  SlateDB,
+  WriteBatch,
+  IsolationLevel,
+  DurabilityLevel,
+  FlushType,
+  CheckpointScope,
+} from "./index";
 
 const urls = (process.env.SLATEDB_TEST_URLS ?? ":memory:")
   .split(",")
@@ -276,6 +283,391 @@ for (const url of urls) {
         const curr = str(items[i].key);
         expect(prev < curr).toBe(true);
       }
+    });
+  });
+
+  // =========================================================================
+  // scan_prefix
+  // =========================================================================
+  describe(`[${label}] scan_prefix`, () => {
+    let db: any;
+
+    beforeAll(async () => {
+      db = await SlateDB.open(uniquePath("prefix"), url);
+      await db.put(Buffer.from("user:1"), Buffer.from("alice"), false);
+      await db.put(Buffer.from("user:2"), Buffer.from("bob"), false);
+      await db.put(Buffer.from("user:3"), Buffer.from("carol"), false);
+      await db.put(Buffer.from("order:1"), Buffer.from("o1"), false);
+      await db.put(Buffer.from("order:2"), Buffer.from("o2"), false);
+    });
+
+    afterAll(async () => {
+      await db.close();
+    });
+
+    test("scanPrefix returns only matching keys", async () => {
+      const items = await db.scanPrefix(Buffer.from("user:"));
+      expect(items).toHaveLength(3);
+      expect(str(items[0].key)).toBe("user:1");
+      expect(str(items[2].key)).toBe("user:3");
+    });
+
+    test("scanPrefix with no matches returns empty array", async () => {
+      const items = await db.scanPrefix(Buffer.from("zzz:"));
+      expect(items).toEqual([]);
+    });
+
+    test("scanPrefix for different prefix", async () => {
+      const items = await db.scanPrefix(Buffer.from("order:"));
+      expect(items).toHaveLength(2);
+    });
+  });
+
+  // =========================================================================
+  // snapshot
+  // =========================================================================
+  describe(`[${label}] snapshot`, () => {
+    let db: any;
+
+    beforeAll(async () => {
+      db = await SlateDB.open(uniquePath("snap"), url);
+    });
+
+    afterAll(async () => {
+      await db.close();
+    });
+
+    test("snapshot sees data at the point it was created", async () => {
+      await db.put(Buffer.from("snap_k1"), Buffer.from("v1"), false);
+      await db.put(Buffer.from("snap_k2"), Buffer.from("v2"), false);
+
+      const snap = await db.snapshot();
+
+      // Write after snapshot
+      await db.put(Buffer.from("snap_k1"), Buffer.from("v1_updated"), false);
+      await db.put(Buffer.from("snap_k3"), Buffer.from("v3"), false);
+
+      // Snapshot reads should see original values
+      expect(str(await snap.get(Buffer.from("snap_k1")))).toBe("v1");
+      expect(str(await snap.get(Buffer.from("snap_k2")))).toBe("v2");
+      // snap_k3 didn't exist at snapshot time
+      expect(await snap.get(Buffer.from("snap_k3"))).toBeNull();
+
+      // DB reads should see updated values
+      expect(str(await db.get(Buffer.from("snap_k1")))).toBe("v1_updated");
+      expect(str(await db.get(Buffer.from("snap_k3")))).toBe("v3");
+    });
+
+    test("snapshot scan returns point-in-time data", async () => {
+      await db.put(Buffer.from("ss_a"), Buffer.from("1"), false);
+      await db.put(Buffer.from("ss_b"), Buffer.from("2"), false);
+
+      const snap = await db.snapshot();
+      await db.put(Buffer.from("ss_c"), Buffer.from("3"), false);
+
+      const items = await snap.scan(Buffer.from("ss_"), Buffer.from("ss_~"));
+      expect(items).toHaveLength(2);
+      expect(str(items[0].key)).toBe("ss_a");
+      expect(str(items[1].key)).toBe("ss_b");
+    });
+
+    test("snapshot scanPrefix", async () => {
+      const snap = await db.snapshot();
+      const items = await snap.scanPrefix(Buffer.from("ss_"));
+      expect(items.length).toBeGreaterThanOrEqual(2);
+    });
+
+    test("snapshot getString", async () => {
+      await db.put(Buffer.from("snap_str"), Buffer.from("hello"), false);
+      const snap = await db.snapshot();
+      expect(await snap.getString(Buffer.from("snap_str"))).toBe("hello");
+    });
+  });
+
+  // =========================================================================
+  // merge operators
+  // =========================================================================
+  describe(`[${label}] merge — string_concat`, () => {
+    let db: any;
+
+    beforeAll(async () => {
+      db = await SlateDB.openWithSettings(uniquePath("merge_str"), url, {
+        mergeOperator: "string_concat",
+      });
+    });
+
+    afterAll(async () => {
+      await db.close();
+    });
+
+    test("merge concatenates values", async () => {
+      await db.put(Buffer.from("mc1"), Buffer.from("hello"), false);
+      await db.merge(Buffer.from("mc1"), Buffer.from(" world"), false);
+      expect(await db.getString(Buffer.from("mc1"))).toBe("hello world");
+    });
+
+    test("merge on non-existent key creates it", async () => {
+      await db.merge(Buffer.from("mc_new"), Buffer.from("fresh"), false);
+      expect(await db.getString(Buffer.from("mc_new"))).toBe("fresh");
+    });
+
+    test("multiple merges accumulate", async () => {
+      await db.merge(Buffer.from("mc_multi"), Buffer.from("a"), false);
+      await db.merge(Buffer.from("mc_multi"), Buffer.from("b"), false);
+      await db.merge(Buffer.from("mc_multi"), Buffer.from("c"), false);
+      expect(await db.getString(Buffer.from("mc_multi"))).toBe("abc");
+    });
+  });
+
+  describe(`[${label}] merge — uint64_add`, () => {
+    let db: any;
+
+    beforeAll(async () => {
+      db = await SlateDB.openWithSettings(uniquePath("merge_u64"), url, {
+        mergeOperator: "uint64_add",
+      });
+    });
+
+    afterAll(async () => {
+      await db.close();
+    });
+
+    const u64 = (n: number) => {
+      const buf = Buffer.alloc(8);
+      buf.writeBigUInt64LE(BigInt(n));
+      return buf;
+    };
+    const readU64 = (buf: Buffer) => Number(Buffer.from(buf).readBigUInt64LE());
+
+    test("merge adds u64 counters", async () => {
+      await db.put(Buffer.from("counter"), u64(100), false);
+      await db.merge(Buffer.from("counter"), u64(5), false);
+      await db.merge(Buffer.from("counter"), u64(10), false);
+      expect(readU64(await db.get(Buffer.from("counter")))).toBe(115);
+    });
+
+    test("merge on non-existent key starts from zero", async () => {
+      await db.merge(Buffer.from("cnt_new"), u64(42), false);
+      expect(readU64(await db.get(Buffer.from("cnt_new")))).toBe(42);
+    });
+  });
+
+  // =========================================================================
+  // merge in WriteBatch
+  // =========================================================================
+  describe(`[${label}] WriteBatch merge`, () => {
+    let db: any;
+
+    beforeAll(async () => {
+      db = await SlateDB.openWithSettings(uniquePath("batch_merge"), url, {
+        mergeOperator: "string_concat",
+      });
+    });
+
+    afterAll(async () => {
+      await db.close();
+    });
+
+    test("WriteBatch with merge operations", async () => {
+      await db.put(Buffer.from("bm1"), Buffer.from("x"), false);
+
+      const batch = new WriteBatch();
+      await batch.merge(Buffer.from("bm1"), Buffer.from("y"));
+      await batch.merge(Buffer.from("bm1"), Buffer.from("z"));
+      await db.writeBatch(batch, false);
+
+      expect(await db.getString(Buffer.from("bm1"))).toBe("xyz");
+    });
+  });
+
+  // =========================================================================
+  // transaction scan / scanPrefix / merge
+  // =========================================================================
+  describe(`[${label}] transaction scan`, () => {
+    let db: any;
+
+    beforeAll(async () => {
+      db = await SlateDB.openWithSettings(uniquePath("txn_scan"), url, {
+        mergeOperator: "string_concat",
+      });
+      await db.put(Buffer.from("ts:a"), Buffer.from("1"), false);
+      await db.put(Buffer.from("ts:b"), Buffer.from("2"), false);
+      await db.put(Buffer.from("ts:c"), Buffer.from("3"), false);
+    });
+
+    afterAll(async () => {
+      await db.close();
+    });
+
+    test("transaction scan sees own writes", async () => {
+      const txn = await db.begin();
+      await txn.put(Buffer.from("ts:d"), Buffer.from("4"));
+      const items = await txn.scan(Buffer.from("ts:"), Buffer.from("ts:~"));
+      expect(items).toHaveLength(4);
+      expect(str(items[3].key)).toBe("ts:d");
+      await txn.commit(false);
+    });
+
+    test("transaction scanPrefix", async () => {
+      const txn = await db.begin();
+      const items = await txn.scanPrefix(Buffer.from("ts:"));
+      expect(items.length).toBeGreaterThanOrEqual(4);
+      await txn.rollback();
+    });
+
+    test("transaction merge", async () => {
+      await db.put(Buffer.from("tm"), Buffer.from("base"), false);
+      const txn = await db.begin();
+      await txn.merge(Buffer.from("tm"), Buffer.from("+ext"));
+      const val = await txn.getString(Buffer.from("tm"));
+      expect(val).toBe("base+ext");
+      await txn.commit(false);
+      expect(await db.getString(Buffer.from("tm"))).toBe("base+ext");
+    });
+  });
+
+  // =========================================================================
+  // flush types
+  // =========================================================================
+  describe(`[${label}] flush options`, () => {
+    let db: any;
+
+    beforeAll(async () => {
+      db = await SlateDB.open(uniquePath("flush_opts"), url);
+    });
+
+    afterAll(async () => {
+      await db.close();
+    });
+
+    test("flush with WAL type", async () => {
+      await db.put(Buffer.from("fw1"), Buffer.from("v1"), false);
+      await db.flush(FlushType.Wal);
+      expect(str(await db.get(Buffer.from("fw1")))).toBe("v1");
+    });
+
+    test("flush with MemTable type", async () => {
+      await db.put(Buffer.from("fm1"), Buffer.from("v1"), false);
+      await db.flush(FlushType.MemTable);
+      expect(str(await db.get(Buffer.from("fm1")))).toBe("v1");
+    });
+  });
+
+  // =========================================================================
+  // metrics
+  // =========================================================================
+  describe(`[${label}] metrics`, () => {
+    let db: any;
+
+    beforeAll(async () => {
+      db = await SlateDB.open(uniquePath("metrics"), url);
+    });
+
+    afterAll(async () => {
+      await db.close();
+    });
+
+    test("metrics returns an array of { name, value }", async () => {
+      await db.put(Buffer.from("m1"), Buffer.from("v1"), false);
+      const metrics = db.metrics();
+      expect(Array.isArray(metrics)).toBe(true);
+      expect(metrics.length).toBeGreaterThan(0);
+      expect(metrics[0]).toHaveProperty("name");
+      expect(metrics[0]).toHaveProperty("value");
+      expect(typeof metrics[0].name).toBe("string");
+      expect(typeof metrics[0].value).toBe("number");
+    });
+  });
+
+  // =========================================================================
+  // checkpoint
+  // =========================================================================
+  describe(`[${label}] checkpoint`, () => {
+    let db: any;
+
+    beforeAll(async () => {
+      db = await SlateDB.open(uniquePath("ckpt"), url);
+    });
+
+    afterAll(async () => {
+      await db.close();
+    });
+
+    test("createCheckpoint returns id and manifestId", async () => {
+      await db.put(Buffer.from("cp1"), Buffer.from("v1"), false);
+      await db.flush();
+      const result = await db.createCheckpoint();
+      expect(result).toHaveProperty("id");
+      expect(result).toHaveProperty("manifestId");
+      expect(typeof result.id).toBe("string");
+      expect(result.id.length).toBeGreaterThan(0);
+      expect(typeof result.manifestId).toBe("number");
+    });
+
+    test("createCheckpoint with name and lifetime", async () => {
+      const result = await db.createCheckpoint(
+        CheckpointScope.Durable,
+        60000, // 60s lifetime
+        "test-checkpoint",
+      );
+      expect(result.id.length).toBeGreaterThan(0);
+    });
+  });
+
+  // =========================================================================
+  // openWithSettings
+  // =========================================================================
+  describe(`[${label}] openWithSettings`, () => {
+    test("custom flush interval and memtable size", async () => {
+      const db = await SlateDB.openWithSettings(uniquePath("settings"), url, {
+        flushIntervalMs: 500,
+        l0SstSizeBytes: 1024 * 1024,
+      });
+      await db.put(Buffer.from("s1"), Buffer.from("v1"), false);
+      expect(str(await db.get(Buffer.from("s1")))).toBe("v1");
+      await db.close();
+    });
+
+    test("unknown merge operator throws", async () => {
+      try {
+        await SlateDB.openWithSettings(uniquePath("bad_merge"), url, {
+          mergeOperator: "nonexistent" as any,
+        });
+        expect(true).toBe(false); // should not reach
+      } catch (e: any) {
+        expect(e.message).toContain("unknown merge operator");
+      }
+    });
+  });
+
+  // =========================================================================
+  // getString convenience
+  // =========================================================================
+  describe(`[${label}] getString`, () => {
+    let db: any;
+
+    beforeAll(async () => {
+      db = await SlateDB.open(uniquePath("getstr"), url);
+    });
+
+    afterAll(async () => {
+      await db.close();
+    });
+
+    test("getString on db", async () => {
+      await db.put(Buffer.from("gs1"), Buffer.from("hello"), false);
+      expect(await db.getString(Buffer.from("gs1"))).toBe("hello");
+    });
+
+    test("getString returns null for missing key", async () => {
+      expect(await db.getString(Buffer.from("gs_missing"))).toBeNull();
+    });
+
+    test("getString on transaction", async () => {
+      const txn = await db.begin();
+      await txn.put(Buffer.from("gs_txn"), Buffer.from("txn_val"));
+      expect(await txn.getString(Buffer.from("gs_txn"))).toBe("txn_val");
+      await txn.rollback();
     });
   });
 }

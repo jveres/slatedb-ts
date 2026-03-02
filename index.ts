@@ -27,7 +27,7 @@ for (const name of candidates) {
 }
 if (!nativePath) {
   throw new Error(
-    `slatedb: could not find native module. Tried: ${candidates.join(", ")}`
+    `slatedb: could not find native module. Tried: ${candidates.join(", ")}`,
   );
 }
 
@@ -46,9 +46,44 @@ export const WriteBatch = native.WriteBatch;
 /** Transaction — ACID transaction with conflict detection. */
 export const Transaction = native.Transaction;
 
+/** Snapshot — read-only point-in-time view of the database. */
+export const Snapshot = native.Snapshot;
+
 /** Isolation levels for transactions. */
 export const IsolationLevel = native.JsIsolationLevel;
 
+/** Durability levels for reads. */
+export const DurabilityLevel = native.JsDurabilityLevel;
+
+/** Flush types. */
+export const FlushType = native.JsFlushType;
+
+/** Checkpoint scopes. */
+export const CheckpointScope = native.JsCheckpointScope;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
 export type KeyValue = { key: Buffer; value: Buffer };
+
+export type Settings = {
+  flushIntervalMs?: number;
+  l0SstSizeBytes?: number;
+  l0MaxSsts?: number;
+  maxUnflushedBytes?: number;
+  defaultTtlMs?: number;
+  mergeOperator?: "string_concat" | "uint64_add";
+};
+
+export type CheckpointResult = {
+  id: string;
+  manifestId: number;
+};
+
+export type Metric = {
+  name: string;
+  value: number;
+};
 
 export default SlateDB;

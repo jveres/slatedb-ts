@@ -1,10 +1,15 @@
+use bytes::Bytes;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
-use slatedb::config::{PutOptions, WriteOptions};
-use slatedb::{Db, DbTransaction, WriteBatch};
+use slatedb::config::{
+    CheckpointOptions, CheckpointScope, DurabilityLevel, FlushOptions, FlushType, MergeOptions,
+    PutOptions, ReadOptions, ScanOptions, Settings, Ttl, WriteOptions,
+};
+use slatedb::{MergeOperator, MergeOperatorError};
+use slatedb::{Db, DbIterator, DbTransaction, WriteBatch};
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,13 +25,92 @@ static WO_NON_DURABLE: WriteOptions = WriteOptions {
     await_durable: false,
 };
 
+fn wo(await_durable: Option<bool>) -> &'static WriteOptions {
+    if await_durable.unwrap_or(true) {
+        &WO_DURABLE
+    } else {
+        &WO_NON_DURABLE
+    }
+}
+
+fn build_put_options(ttl: Option<u64>) -> PutOptions {
+    PutOptions {
+        ttl: match ttl {
+            None => Ttl::Default,
+            Some(0) => Ttl::NoExpiry,
+            Some(ms) => Ttl::ExpireAfter(ms),
+        },
+    }
+}
+
+fn build_read_options(read_level: Option<JsDurabilityLevel>) -> ReadOptions {
+    let mut opts = ReadOptions::default();
+    if let Some(level) = read_level {
+        opts.durability_filter = match level {
+            JsDurabilityLevel::Memory => DurabilityLevel::Memory,
+            JsDurabilityLevel::Remote => DurabilityLevel::Remote,
+        };
+    }
+    opts
+}
+
+fn build_scan_options(
+    read_level: Option<JsDurabilityLevel>,
+    read_ahead_bytes: Option<u32>,
+    max_fetch_tasks: Option<u32>,
+) -> ScanOptions {
+    let mut opts = ScanOptions::default();
+    if let Some(level) = read_level {
+        opts.durability_filter = match level {
+            JsDurabilityLevel::Memory => DurabilityLevel::Memory,
+            JsDurabilityLevel::Remote => DurabilityLevel::Remote,
+        };
+    }
+    if let Some(n) = read_ahead_bytes {
+        opts.read_ahead_bytes = n as usize;
+    }
+    if let Some(n) = max_fetch_tasks {
+        opts.max_fetch_tasks = n as usize;
+    }
+    opts
+}
+
+fn build_flush_options(flush_type: Option<JsFlushType>) -> FlushOptions {
+    FlushOptions {
+        flush_type: match flush_type.unwrap_or(JsFlushType::Wal) {
+            JsFlushType::MemTable => FlushType::MemTable,
+            JsFlushType::Wal => FlushType::Wal,
+        },
+    }
+}
+
+fn make_range(
+    start: &Option<Buffer>,
+    end: &Option<Buffer>,
+) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+    let lo = match start {
+        Some(b) => Bound::Included(b.to_vec()),
+        None => Bound::Unbounded,
+    };
+    let hi = match end {
+        Some(b) => Bound::Excluded(b.to_vec()),
+        None => Bound::Unbounded,
+    };
+    (lo, hi)
+}
+
+async fn collect_iter(mut iter: DbIterator) -> Result<Vec<KeyValue>> {
+    let mut results = Vec::new();
+    while let Some(kv) = iter.next().await.map_err(to_napi_err)? {
+        results.push(KeyValue {
+            key: Buffer::from(kv.key.to_vec()),
+            value: Buffer::from(kv.value.to_vec()),
+        });
+    }
+    Ok(results)
+}
+
 /// Resolve an object store from a URL string.
-///
-/// Supported schemes:
-///   `:memory:`       — in-memory (default)
-///   `file:///path`   — local filesystem
-///   `s3://bucket`    — AWS S3, Cloudflare R2, MinIO (reads AWS_* env vars)
-///   `az://container` — Azure Blob (reads AZURE_* env vars)
 fn resolve_store(url: &str) -> Result<Arc<dyn ObjectStore>> {
     if url.is_empty() || url == ":memory:" {
         Ok(Arc::new(InMemory::new()))
@@ -67,12 +151,101 @@ pub struct KeyValue {
 }
 
 // ---------------------------------------------------------------------------
-// IsolationLevel enum
+// CheckpointResult — returned from createCheckpoint
+// ---------------------------------------------------------------------------
+#[napi(object)]
+pub struct JsCheckpointResult {
+    pub id: String,
+    pub manifest_id: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Enums
 // ---------------------------------------------------------------------------
 #[napi]
 pub enum JsIsolationLevel {
     Snapshot,
     SerializableSnapshot,
+}
+
+#[napi]
+pub enum JsDurabilityLevel {
+    Memory,
+    Remote,
+}
+
+#[napi]
+pub enum JsFlushType {
+    MemTable,
+    Wal,
+}
+
+#[napi]
+pub enum JsCheckpointScope {
+    All,
+    Durable,
+}
+
+// ---------------------------------------------------------------------------
+// Built-in merge operators
+// ---------------------------------------------------------------------------
+
+/// A string-concatenation merge operator (for testing / simple use cases).
+struct StringConcatMergeOperator;
+
+impl MergeOperator for StringConcatMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        value: Bytes,
+    ) -> std::result::Result<Bytes, MergeOperatorError> {
+        let mut result = existing_value.unwrap_or_default().to_vec();
+        result.extend_from_slice(&value);
+        Ok(Bytes::from(result))
+    }
+}
+
+/// A u64 counter merge operator — each merge operand is an 8-byte LE u64 to add.
+struct Uint64AddMergeOperator;
+
+impl MergeOperator for Uint64AddMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        value: Bytes,
+    ) -> std::result::Result<Bytes, MergeOperatorError> {
+        let existing = existing_value
+            .and_then(|v| v.as_ref().try_into().ok().map(u64::from_le_bytes))
+            .unwrap_or(0);
+        let add = value
+            .as_ref()
+            .try_into()
+            .ok()
+            .map(u64::from_le_bytes)
+            .unwrap_or(0);
+        Ok(Bytes::copy_from_slice(&(existing + add).to_le_bytes()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings object — JS-friendly subset of slatedb::config::Settings
+// ---------------------------------------------------------------------------
+#[napi(object)]
+pub struct JsSettings {
+    /// Flush interval in milliseconds. Null = disable automatic flushing.
+    pub flush_interval_ms: Option<u32>,
+    /// Min memtable size before flush to L0 (bytes).
+    pub l0_sst_size_bytes: Option<u32>,
+    /// Max number of L0 SSTs before backpressure.
+    pub l0_max_ssts: Option<u32>,
+    /// Max unflushed bytes before writer backpressure.
+    pub max_unflushed_bytes: Option<u32>,
+    /// Default TTL for put operations (milliseconds). Null = no expiry.
+    pub default_ttl_ms: Option<u32>,
+    /// Merge operator: "string_concat" or "uint64_add". Null = no merge support.
+    pub merge_operator: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +258,7 @@ pub struct SlateDB {
 
 #[napi]
 impl SlateDB {
-    /// Open a SlateDB instance.
+    /// Open a SlateDB instance with default settings.
     /// Times out after 30 seconds on misconfigured backends.
     #[napi(factory)]
     pub async fn open(path: String, url: Option<String>) -> Result<SlateDB> {
@@ -102,6 +275,63 @@ impl SlateDB {
         Ok(SlateDB { db })
     }
 
+    /// Open a SlateDB instance with custom settings.
+    #[napi(factory, js_name = "openWithSettings")]
+    pub async fn open_with_settings(
+        path: String,
+        url: Option<String>,
+        settings: JsSettings,
+    ) -> Result<SlateDB> {
+        let url = url.unwrap_or_else(|| ":memory:".to_string());
+        let store = resolve_store(&url)?;
+
+        let mut cfg = Settings::default();
+        if let Some(ms) = settings.flush_interval_ms {
+            cfg.flush_interval = Some(Duration::from_millis(ms as u64));
+        }
+        if let Some(n) = settings.l0_sst_size_bytes {
+            cfg.l0_sst_size_bytes = n as usize;
+        }
+        if let Some(n) = settings.l0_max_ssts {
+            cfg.l0_max_ssts = n as usize;
+        }
+        if let Some(n) = settings.max_unflushed_bytes {
+            cfg.max_unflushed_bytes = n as usize;
+        }
+        if let Some(ttl) = settings.default_ttl_ms {
+            cfg.default_ttl = Some(ttl as u64);
+        }
+
+        let merge_op: Option<Arc<dyn MergeOperator + Send + Sync>> =
+            match settings.merge_operator.as_deref() {
+                Some("string_concat") => Some(Arc::new(StringConcatMergeOperator)),
+                Some("uint64_add") => Some(Arc::new(Uint64AddMergeOperator)),
+                Some(other) => {
+                    return Err(Error::from_reason(format!(
+                        "unknown merge operator: '{other}'. Use 'string_concat' or 'uint64_add'"
+                    )))
+                }
+                None => None,
+            };
+        cfg.merge_operator = merge_op;
+
+        let builder = Db::builder(path.as_str(), store).with_settings(cfg);
+
+        let db = tokio::time::timeout(Duration::from_secs(30), builder.build())
+            .await
+            .map_err(|_| {
+                Error::from_reason(
+                    "SlateDB.open timed out after 30s — check credentials, region, and bucket access",
+                )
+            })?
+            .map_err(to_napi_err)?;
+        Ok(SlateDB { db })
+    }
+
+    // -----------------------------------------------------------------------
+    // Put / Delete
+    // -----------------------------------------------------------------------
+
     /// Put a key-value pair.
     #[napi]
     pub async unsafe fn put(
@@ -109,39 +339,12 @@ impl SlateDB {
         key: Buffer,
         value: Buffer,
         await_durable: Option<bool>,
+        ttl: Option<u32>,
     ) -> Result<()> {
-        let opts = if await_durable.unwrap_or(true) {
-            &WO_DURABLE
-        } else {
-            &WO_NON_DURABLE
-        };
         self.db
-            .put_with_options(&key[..], &value[..], &PutOptions::default(), opts)
+            .put_with_options(&key[..], &value[..], &build_put_options(ttl.map(|v| v as u64)), wo(await_durable))
             .await
-            .map_err(to_napi_err)?;
-        Ok(())
-    }
-
-    /// Get raw bytes by key. Returns null if not found.
-    #[napi]
-    pub async fn get(&self, key: Buffer) -> Result<Option<Buffer>> {
-        match self.db.get(&key[..]).await.map_err(to_napi_err)? {
-            Some(val) => Ok(Some(Buffer::from(val.to_vec()))),
-            None => Ok(None),
-        }
-    }
-
-    /// Get value as UTF-8 string. Returns null if not found.
-    #[napi(js_name = "getString")]
-    pub async fn get_string(&self, key: Buffer) -> Result<Option<String>> {
-        match self.db.get(&key[..]).await.map_err(to_napi_err)? {
-            Some(val) => {
-                let s = String::from_utf8(val.to_vec())
-                    .map_err(|e| Error::from_reason(format!("invalid UTF-8: {e}")))?;
-                Ok(Some(s))
-            }
-            None => Ok(None),
-        }
+            .map_err(to_napi_err)
     }
 
     /// Delete a key.
@@ -151,23 +354,78 @@ impl SlateDB {
         key: Buffer,
         await_durable: Option<bool>,
     ) -> Result<()> {
-        let opts = if await_durable.unwrap_or(true) {
-            &WO_DURABLE
-        } else {
-            &WO_NON_DURABLE
-        };
         self.db
-            .delete_with_options(&key[..], opts)
+            .delete_with_options(&key[..], wo(await_durable))
             .await
-            .map_err(to_napi_err)?;
-        Ok(())
+            .map_err(to_napi_err)
     }
 
-    /// Flush the memtable to object storage.
+    // -----------------------------------------------------------------------
+    // Merge
+    // -----------------------------------------------------------------------
+
+    /// Merge a value into the database using the configured merge operator.
+    /// Requires a merge operator to be set via openWithSettings.
     #[napi]
-    pub async fn flush(&self) -> Result<()> {
-        self.db.flush().await.map_err(to_napi_err)
+    pub async unsafe fn merge(
+        &mut self,
+        key: Buffer,
+        value: Buffer,
+        await_durable: Option<bool>,
+        ttl: Option<u32>,
+    ) -> Result<()> {
+        let merge_opts = MergeOptions {
+            ttl: match ttl.map(|v| v as u64) {
+                None => Ttl::Default,
+                Some(0) => Ttl::NoExpiry,
+                Some(ms) => Ttl::ExpireAfter(ms),
+            },
+        };
+        self.db
+            .merge_with_options(&key[..], &value[..], &merge_opts, wo(await_durable))
+            .await
+            .map_err(to_napi_err)
     }
+
+    // -----------------------------------------------------------------------
+    // Get
+    // -----------------------------------------------------------------------
+
+    /// Get raw bytes by key. Returns null if not found.
+    #[napi]
+    pub async fn get(
+        &self,
+        key: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+    ) -> Result<Option<Buffer>> {
+        let opts = build_read_options(read_level);
+        match self.db.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
+            Some(val) => Ok(Some(Buffer::from(val.to_vec()))),
+            None => Ok(None),
+        }
+    }
+
+    /// Get value as UTF-8 string. Returns null if not found.
+    #[napi(js_name = "getString")]
+    pub async fn get_string(
+        &self,
+        key: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+    ) -> Result<Option<String>> {
+        let opts = build_read_options(read_level);
+        match self.db.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
+            Some(val) => {
+                let s = String::from_utf8(val.to_vec())
+                    .map_err(|e| Error::from_reason(format!("invalid UTF-8: {e}")))?;
+                Ok(Some(s))
+            }
+            None => Ok(None),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Scan
+    // -----------------------------------------------------------------------
 
     /// Range scan [start, end). Both bounds optional (full scan if omitted).
     #[napi]
@@ -175,28 +433,50 @@ impl SlateDB {
         &self,
         start: Option<Buffer>,
         end: Option<Buffer>,
+        read_level: Option<JsDurabilityLevel>,
+        read_ahead_bytes: Option<u32>,
+        max_fetch_tasks: Option<u32>,
     ) -> Result<Vec<KeyValue>> {
-        let lo = match &start {
-            Some(b) => Bound::Included(b.to_vec()),
-            None => Bound::Unbounded,
-        };
-        let hi = match &end {
-            Some(b) => Bound::Excluded(b.to_vec()),
-            None => Bound::Unbounded,
-        };
-
-        let mut iter = self.db.scan((lo, hi)).await.map_err(to_napi_err)?;
-        let mut results = Vec::new();
-
-        while let Some(kv) = iter.next().await.map_err(to_napi_err)? {
-            results.push(KeyValue {
-                key: Buffer::from(kv.key.to_vec()),
-                value: Buffer::from(kv.value.to_vec()),
-            });
-        }
-
-        Ok(results)
+        let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
+        let range = make_range(&start, &end);
+        let iter = self.db.scan_with_options(range, &opts).await.map_err(to_napi_err)?;
+        collect_iter(iter).await
     }
+
+    /// Prefix scan — returns all keys starting with the given prefix.
+    #[napi(js_name = "scanPrefix")]
+    pub async fn scan_prefix(
+        &self,
+        prefix: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+        read_ahead_bytes: Option<u32>,
+        max_fetch_tasks: Option<u32>,
+    ) -> Result<Vec<KeyValue>> {
+        let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
+        let iter = self
+            .db
+            .scan_prefix_with_options(&prefix[..], &opts)
+            .await
+            .map_err(to_napi_err)?;
+        collect_iter(iter).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Flush
+    // -----------------------------------------------------------------------
+
+    /// Flush to object storage.
+    #[napi]
+    pub async fn flush(&self, flush_type: Option<JsFlushType>) -> Result<()> {
+        self.db
+            .flush_with_options(build_flush_options(flush_type))
+            .await
+            .map_err(to_napi_err)
+    }
+
+    // -----------------------------------------------------------------------
+    // WriteBatch
+    // -----------------------------------------------------------------------
 
     /// Write a batch atomically.
     #[napi(js_name = "writeBatch")]
@@ -205,28 +485,25 @@ impl SlateDB {
         batch: &JsWriteBatch,
         await_durable: Option<bool>,
     ) -> Result<()> {
-        let opts = if await_durable.unwrap_or(true) {
-            &WO_DURABLE
-        } else {
-            &WO_NON_DURABLE
-        };
         let wb = {
             let mut guard = batch.inner.lock().await;
-            guard.take().ok_or_else(|| Error::from_reason("WriteBatch already consumed"))?
+            guard
+                .take()
+                .ok_or_else(|| Error::from_reason("WriteBatch already consumed"))?
         };
         self.db
-            .write_with_options(wb, opts)
+            .write_with_options(wb, wo(await_durable))
             .await
-            .map_err(to_napi_err)?;
-        Ok(())
+            .map_err(to_napi_err)
     }
+
+    // -----------------------------------------------------------------------
+    // Transaction
+    // -----------------------------------------------------------------------
 
     /// Begin an ACID transaction.
     #[napi]
-    pub async fn begin(
-        &self,
-        isolation: Option<JsIsolationLevel>,
-    ) -> Result<JsTransaction> {
+    pub async fn begin(&self, isolation: Option<JsIsolationLevel>) -> Result<JsTransaction> {
         let level = match isolation.unwrap_or(JsIsolationLevel::Snapshot) {
             JsIsolationLevel::Snapshot => slatedb::IsolationLevel::Snapshot,
             JsIsolationLevel::SerializableSnapshot => {
@@ -239,11 +516,88 @@ impl SlateDB {
         })
     }
 
+    // -----------------------------------------------------------------------
+    // Snapshot
+    // -----------------------------------------------------------------------
+
+    /// Create a read-only point-in-time snapshot.
+    #[napi]
+    pub async fn snapshot(&self) -> Result<JsSnapshot> {
+        let snap = self.db.snapshot().await.map_err(to_napi_err)?;
+        Ok(JsSnapshot { inner: snap })
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint
+    // -----------------------------------------------------------------------
+
+    /// Create a checkpoint for backup/restore.
+    #[napi(js_name = "createCheckpoint")]
+    pub async fn create_checkpoint(
+        &self,
+        scope: Option<JsCheckpointScope>,
+        lifetime_ms: Option<f64>,
+        name: Option<String>,
+    ) -> Result<JsCheckpointResult> {
+        let s = match scope.unwrap_or(JsCheckpointScope::All) {
+            JsCheckpointScope::All => CheckpointScope::All,
+            JsCheckpointScope::Durable => CheckpointScope::Durable,
+        };
+        let opts = CheckpointOptions {
+            lifetime: lifetime_ms.map(|ms| Duration::from_millis(ms as u64)),
+            source: None,
+            name,
+        };
+        let result = self
+            .db
+            .create_checkpoint(s, &opts)
+            .await
+            .map_err(to_napi_err)?;
+        Ok(JsCheckpointResult {
+            id: result.id.to_string(),
+            manifest_id: result.manifest_id as i64,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Metrics
+    // -----------------------------------------------------------------------
+
+    /// Get database metrics as a flat key-value object.
+    #[napi]
+    pub fn metrics(&self) -> Result<Vec<JsMetric>> {
+        let registry = self.db.metrics();
+        let names = registry.names();
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some(stat) = registry.lookup(name) {
+                out.push(JsMetric {
+                    name: name.to_string(),
+                    value: stat.get(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------------
+    // Close
+    // -----------------------------------------------------------------------
+
     /// Close the database and free native resources.
     #[napi]
     pub async unsafe fn close(&mut self) -> Result<()> {
         self.db.close().await.map_err(to_napi_err)
     }
+}
+
+// ---------------------------------------------------------------------------
+// JsMetric — returned from metrics()
+// ---------------------------------------------------------------------------
+#[napi(object)]
+pub struct JsMetric {
+    pub name: String,
+    pub value: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,14 +617,36 @@ impl JsWriteBatch {
         }
     }
 
-    /// Add a put to the batch.
+    /// Add a put to the batch (with optional TTL in ms).
     #[napi]
-    pub async fn put(&self, key: Buffer, value: Buffer) -> Result<()> {
+    pub async fn put(&self, key: Buffer, value: Buffer, ttl: Option<u32>) -> Result<()> {
         let mut guard = self.inner.lock().await;
         let wb = guard
             .as_mut()
             .ok_or_else(|| Error::from_reason("WriteBatch already consumed"))?;
-        wb.put(&key[..], &value[..]);
+        wb.put_with_options(
+            &key[..],
+            &value[..],
+            &build_put_options(ttl.map(|v| v as u64)),
+        );
+        Ok(())
+    }
+
+    /// Add a merge to the batch (with optional TTL in ms).
+    #[napi]
+    pub async fn merge(&self, key: Buffer, value: Buffer, ttl: Option<u32>) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let wb = guard
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("WriteBatch already consumed"))?;
+        let merge_opts = MergeOptions {
+            ttl: match ttl.map(|v| v as u64) {
+                None => Ttl::Default,
+                Some(0) => Ttl::NoExpiry,
+                Some(ms) => Ttl::ExpireAfter(ms),
+            },
+        };
+        wb.merge_with_options(&key[..], &value[..], &merge_opts);
         Ok(())
     }
 
@@ -304,24 +680,30 @@ pub struct JsTransaction {
 
 #[napi]
 impl JsTransaction {
-    /// Put within the transaction.
+    /// Put within the transaction (with optional TTL).
     #[napi]
-    pub async fn put(&self, key: Buffer, value: Buffer) -> Result<()> {
+    pub async fn put(&self, key: Buffer, value: Buffer, ttl: Option<u32>) -> Result<()> {
         let guard = self.inner.lock().await;
         let txn = guard
             .as_ref()
             .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
-        txn.put(&key[..], &value[..]).map_err(to_napi_err)
+        txn.put_with_options(
+            &key[..],
+            &value[..],
+            &build_put_options(ttl.map(|v| v as u64)),
+        )
+        .map_err(to_napi_err)
     }
 
-    /// Get within the transaction. Returns null if not found.
+    /// Get within the transaction.
     #[napi]
-    pub async fn get(&self, key: Buffer) -> Result<Option<Buffer>> {
+    pub async fn get(&self, key: Buffer, read_level: Option<JsDurabilityLevel>) -> Result<Option<Buffer>> {
         let guard = self.inner.lock().await;
         let txn = guard
             .as_ref()
             .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
-        match txn.get(&key[..]).await.map_err(to_napi_err)? {
+        let opts = build_read_options(read_level);
+        match txn.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
             Some(val) => Ok(Some(Buffer::from(val.to_vec()))),
             None => Ok(None),
         }
@@ -329,12 +711,13 @@ impl JsTransaction {
 
     /// Get within the transaction as UTF-8 string.
     #[napi(js_name = "getString")]
-    pub async fn get_string(&self, key: Buffer) -> Result<Option<String>> {
+    pub async fn get_string(&self, key: Buffer, read_level: Option<JsDurabilityLevel>) -> Result<Option<String>> {
         let guard = self.inner.lock().await;
         let txn = guard
             .as_ref()
             .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
-        match txn.get(&key[..]).await.map_err(to_napi_err)? {
+        let opts = build_read_options(read_level);
+        match txn.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
             Some(val) => {
                 let s = String::from_utf8(val.to_vec())
                     .map_err(|e| Error::from_reason(format!("invalid UTF-8: {e}")))?;
@@ -354,6 +737,61 @@ impl JsTransaction {
         txn.delete(&key[..]).map_err(to_napi_err)
     }
 
+    /// Merge within the transaction.
+    #[napi]
+    pub async fn merge(&self, key: Buffer, value: Buffer, ttl: Option<u32>) -> Result<()> {
+        let guard = self.inner.lock().await;
+        let txn = guard
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
+        let merge_opts = MergeOptions {
+            ttl: match ttl.map(|v| v as u64) {
+                None => Ttl::Default,
+                Some(0) => Ttl::NoExpiry,
+                Some(ms) => Ttl::ExpireAfter(ms),
+            },
+        };
+        txn.merge_with_options(&key[..], &value[..], &merge_opts)
+            .map_err(to_napi_err)
+    }
+
+    /// Scan within the transaction [start, end).
+    #[napi]
+    pub async fn scan(
+        &self,
+        start: Option<Buffer>,
+        end: Option<Buffer>,
+        read_level: Option<JsDurabilityLevel>,
+    ) -> Result<Vec<KeyValue>> {
+        let guard = self.inner.lock().await;
+        let txn = guard
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
+        let opts = build_scan_options(read_level, None, None);
+        let range = make_range(&start, &end);
+        let iter = txn.scan_with_options(range, &opts).await.map_err(to_napi_err)?;
+        collect_iter(iter).await
+    }
+
+    /// Prefix scan within the transaction.
+    #[napi(js_name = "scanPrefix")]
+    pub async fn scan_prefix(
+        &self,
+        prefix: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+    ) -> Result<Vec<KeyValue>> {
+        let guard = self.inner.lock().await;
+        let txn = guard
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
+        let opts = build_scan_options(read_level, None, None);
+        let iter = txn
+            .scan_prefix_with_options(&prefix[..], &opts)
+            .await
+            .map_err(to_napi_err)?;
+        collect_iter(iter).await
+    }
+
     /// Commit the transaction.
     #[napi]
     pub async fn commit(&self, await_durable: Option<bool>) -> Result<()> {
@@ -361,12 +799,9 @@ impl JsTransaction {
         let txn = guard
             .take()
             .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
-        let opts = if await_durable.unwrap_or(true) {
-            &WO_DURABLE
-        } else {
-            &WO_NON_DURABLE
-        };
-        txn.commit_with_options(opts).await.map_err(to_napi_err)?;
+        txn.commit_with_options(wo(await_durable))
+            .await
+            .map_err(to_napi_err)?;
         Ok(())
     }
 
@@ -379,5 +814,74 @@ impl JsTransaction {
             .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
         txn.rollback();
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot class — read-only point-in-time view
+// ---------------------------------------------------------------------------
+#[napi(js_name = "Snapshot")]
+pub struct JsSnapshot {
+    inner: Arc<slatedb::DbSnapshot>,
+}
+
+#[napi]
+impl JsSnapshot {
+    /// Get raw bytes by key.
+    #[napi]
+    pub async fn get(&self, key: Buffer, read_level: Option<JsDurabilityLevel>) -> Result<Option<Buffer>> {
+        let opts = build_read_options(read_level);
+        match self.inner.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
+            Some(val) => Ok(Some(Buffer::from(val.to_vec()))),
+            None => Ok(None),
+        }
+    }
+
+    /// Get value as UTF-8 string.
+    #[napi(js_name = "getString")]
+    pub async fn get_string(&self, key: Buffer, read_level: Option<JsDurabilityLevel>) -> Result<Option<String>> {
+        let opts = build_read_options(read_level);
+        match self.inner.get_with_options(&key[..], &opts).await.map_err(to_napi_err)? {
+            Some(val) => {
+                let s = String::from_utf8(val.to_vec())
+                    .map_err(|e| Error::from_reason(format!("invalid UTF-8: {e}")))?;
+                Ok(Some(s))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Range scan [start, end).
+    #[napi]
+    pub async fn scan(
+        &self,
+        start: Option<Buffer>,
+        end: Option<Buffer>,
+        read_level: Option<JsDurabilityLevel>,
+        read_ahead_bytes: Option<u32>,
+        max_fetch_tasks: Option<u32>,
+    ) -> Result<Vec<KeyValue>> {
+        let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
+        let range = make_range(&start, &end);
+        let iter = self.inner.scan_with_options(range, &opts).await.map_err(to_napi_err)?;
+        collect_iter(iter).await
+    }
+
+    /// Prefix scan.
+    #[napi(js_name = "scanPrefix")]
+    pub async fn scan_prefix(
+        &self,
+        prefix: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+        read_ahead_bytes: Option<u32>,
+        max_fetch_tasks: Option<u32>,
+    ) -> Result<Vec<KeyValue>> {
+        let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
+        let iter = self
+            .inner
+            .scan_prefix_with_options(&prefix[..], &opts)
+            .await
+            .map_err(to_napi_err)?;
+        collect_iter(iter).await
     }
 }
