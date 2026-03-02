@@ -81,7 +81,7 @@ Open a database. `path` is the logical key prefix inside the store. `url` select
 | `az://container` | Azure Blob Storage   | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY`  |
 | `gs://bucket`    | Google Cloud Storage | `GOOGLE_SERVICE_ACCOUNT`                                   |
 
-URL resolution and credential loading is handled by the Rust [`object_store`](https://docs.rs/object_store) crate via `Db::resolve_object_store()`.
+For S3, credentials are loaded via [`AmazonS3Builder::from_env()`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env) with `S3ConditionalPut::ETagMatch` (required for SlateDB's manifest fencing). For other backends, URL resolution is handled by the Rust [`object_store`](https://docs.rs/object_store) crate. `Db::open()` has a 30-second timeout to prevent hanging on misconfigured backends.
 
 > **Coming from the Rust `slatedb-bencher`?** The Rust CLI uses the older `admin::load_object_store_from_env()` API which reads a `CLOUD_PROVIDER` env var. This bridge uses URL strings instead — the mapping is:
 >
@@ -151,6 +151,7 @@ Close the database and free native resources.
 
 ```typescript
 export { SlateDB, WriteBatch, Transaction, IsolationLevel };
+export default SlateDB;
 export type { KeyValue }; // { key: Uint8Array, value: Uint8Array }
 ```
 
@@ -285,7 +286,7 @@ Transaction throughput is at **exact parity** — the `begin`/`put`/`commit` pat
 │  TypeScript │ ──────────▶    │  libslatedb_ffi  │ ──▶ │    SlateDB     │
 │  (index.ts) │  C ABI ptrs    │  (Rust cdylib)   │     │  (Rust crate)  │
 └─────────────┘                └──────────────────┘     └────────────────┘
-  SlateDB                       30 extern "C" fns          Db, DbTransaction,
+  SlateDB                       28 extern "C" fns          Db, DbTransaction,
   WriteBatch                    opaque handles:            WriteBatch,
   Transaction                    DbHandle                  IsolationLevel
   IsolationLevel                 BufHandle
@@ -298,14 +299,14 @@ Transaction throughput is at **exact parity** — the `begin`/`put`/`commit` pat
                                                     └──────────────────────┘
 ```
 
-The Rust layer (`src/lib.rs`) exposes 30 `extern "C"` functions organized in 6 groups:
+The Rust layer (`src/lib.rs`) exposes 28 `extern "C"` functions organized in 6 groups:
 
 | Group           | Functions                                                                     | Purpose                                        |
 | --------------- | ----------------------------------------------------------------------------- | ---------------------------------------------- |
 | **Lifecycle**   | `open`, `close`                                                               | Database open/close                            |
 | **KV ops**      | `put`, `get`, `delete`, `flush`                                               | Core key-value operations                      |
-| **Scan**        | `scan`, `scan_count`, `scan_len`, `scan_copy`, `scan_free`                    | Range iteration with flat-buffer serialization |
-| **Buf**         | `buf_ptr`, `buf_len`, `buf_copy`, `buf_free`                                  | Safe value retrieval into JS-owned memory      |
+| **Scan**        | `scan`, `scan_count`, `scan_count_only`, `scan_ptr`, `scan_len`, `scan_copy`, `scan_free` | Range iteration with flat-buffer serialization |
+| **Buf**         | `buf_ptr`, `buf_len`, `buf_copy`, `buf_free`                                              | Safe value retrieval into JS-owned memory      |
 | **WriteBatch**  | `batch_new`, `batch_put`, `batch_delete`, `batch_write`, `batch_free`         | Atomic batch writes                            |
 | **Transaction** | `txn_begin`, `txn_put`, `txn_get`, `txn_delete`, `txn_commit`, `txn_rollback` | ACID transactions                              |
 
@@ -318,7 +319,7 @@ A process-global Tokio runtime drives SlateDB's async operations via `block_on`.
 ```
 ├── Cargo.toml         Rust crate — cdylib linking slatedb + object_store (aws, azure)
 ├── bunfig.toml        Bun config — 30s test timeout for cloud backends
-├── src/lib.rs         C ABI FFI layer — 30 functions (db, batch, transaction, scan)
+├── src/lib.rs         C ABI FFI layer — 28 functions (db, batch, transaction, scan)
 ├── index.ts           TypeScript classes — SlateDB, WriteBatch, Transaction, IsolationLevel
 ├── test.spec.ts       Integration tests — 23 tests across 4 groups, multi-backend
 ├── bench.ts           Micro-benchmark — ported from Criterion bench (put, get, scan, open_close)
