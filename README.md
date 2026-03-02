@@ -188,6 +188,8 @@ SLATEDB_TEST_URLS="az://my-container" bun test
 
 Every backend listed in `SLATEDB_TEST_URLS` (comma-separated) gets the full 23-test suite. Each run uses unique timestamped paths to avoid collisions on persistent stores.
 
+**Cloud backend latency:** Tests use `awaitDurable=true` (the default) to test the real durability code path. Each durable write blocks on flush interval (100ms) + object store round-trip, so cloud backends are slower than in-memory (~20-60s vs ~2s). The per-test timeout is set to 30s in `bunfig.toml` to accommodate this. SlateDB's own integration test ([`tests/db.rs`](https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs)) uses `await_durable: false` with a single `flush()` at the end for the same reason.
+
 ## Benchmark
 
 ### Micro-benchmark
@@ -315,6 +317,7 @@ A process-global Tokio runtime drives SlateDB's async operations via `block_on`.
 
 ```
 ├── Cargo.toml         Rust crate — cdylib linking slatedb + object_store (aws, azure)
+├── bunfig.toml        Bun config — 30s test timeout for cloud backends
 ├── src/lib.rs         C ABI FFI layer — 30 functions (db, batch, transaction, scan)
 ├── index.ts           TypeScript classes — SlateDB, WriteBatch, Transaction, IsolationLevel
 ├── test.spec.ts       Integration tests — 23 tests across 4 groups, multi-backend

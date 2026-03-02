@@ -113,13 +113,7 @@ console.log("(ported from slatedb/benches/db_operations.rs)\n");
 {
   const db = SlateDB.open("/tmp/bench_get", ":memory:");
   db.put("key", "value");
-  report(
-    bench(
-      "get (hot key)",
-      () => db.get("key"),
-      1_000,
-    ),
-  );
+  report(bench("get (hot key)", () => db.get("key"), 1_000));
   db.close();
 }
 
@@ -127,15 +121,13 @@ console.log("(ported from slatedb/benches/db_operations.rs)\n");
 {
   const db = SlateDB.open("/tmp/bench_scan", ":memory:");
   for (let i = 0; i < 100; i++) {
-    db.put(`key_${String(i).padStart(4, "0")}`, `val_${"x".repeat(100)}`, false);
+    db.put(
+      `key_${String(i).padStart(4, "0")}`,
+      `val_${"x".repeat(100)}`,
+      false,
+    );
   }
   db.flush();
-  report(
-    bench(
-      "scan (100 keys, ~100B values)",
-      () => db.scan(),
-      10_000,
-    ),
-  );
+  report(bench("scan (100 keys, ~100B values)", () => db.scan(), 1_000));
   db.close();
 }
