@@ -134,6 +134,26 @@ fn resolve_store(url: &str) -> Result<Arc<dyn ObjectStore>> {
     }
 }
 
+/// Quick probe to verify credentials/access before opening the database.
+/// Issues a HEAD request with a short timeout. Auth errors (403/401) surface
+/// in ~1-2s instead of hanging for 30s in SlateDB's infinite-retry loop.
+/// NotFound is expected (the probe path doesn't exist) and means access is OK.
+async fn probe_store(store: &Arc<dyn ObjectStore>) -> Result<()> {
+    use object_store::path::Path as ObjPath;
+    let probe_path = ObjPath::from("__slatedb_probe__");
+    let probe = store.head(&probe_path);
+    match tokio::time::timeout(Duration::from_secs(5), probe).await {
+        Ok(Ok(_)) => Ok(()), // path exists (unlikely)
+        Ok(Err(object_store::Error::NotFound { .. })) => Ok(()), // expected — access OK
+        Ok(Err(e)) => Err(Error::from_reason(format!(
+            "store access check failed: {e}"
+        ))),
+        Err(_) => Err(Error::from_reason(
+            "store access check timed out after 5s — check credentials, region, and endpoint",
+        )),
+    }
+}
+
 fn to_napi_err(e: slatedb::Error) -> Error {
     Error::from_reason(format!("{e}"))
 }
@@ -266,6 +286,12 @@ impl SlateDB {
     ) -> Result<SlateDB> {
         let url = url.unwrap_or_else(|| ":memory:".to_string());
         let store = resolve_store(&url)?;
+
+        // Quick probe for cloud backends — catches auth errors in ~1-2s
+        // instead of hanging for 30s in SlateDB's infinite-retry loop.
+        if url.starts_with("s3://") || url.starts_with("az://") || url.starts_with("gs://") {
+            probe_store(&store).await?;
+        }
 
         let db = match settings {
             Some(settings) => {
