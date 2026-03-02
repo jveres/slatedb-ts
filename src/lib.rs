@@ -7,6 +7,7 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::ptr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Runtime;
 
 // ---------------------------------------------------------------------------
@@ -59,6 +60,7 @@ fn resolve_store(url: *const c_char) -> Arc<dyn ObjectStore> {
 // ===========================================================================
 
 /// Open a database. Returns opaque handle (null on error).
+/// Times out after 30 seconds to avoid hanging on unreachable object stores.
 #[no_mangle]
 pub extern "C" fn slatedb_open(path: *const c_char, url: *const c_char) -> *mut DbHandle {
     let p = cstr_to_str(path);
@@ -66,13 +68,19 @@ pub extern "C" fn slatedb_open(path: *const c_char, url: *const c_char) -> *mut 
     eprintln!("[ffi] resolving store for '{u}'...");
     let store = resolve_store(url);
     eprintln!("[ffi] store resolved, opening db at '{p}'...");
-    match RT.block_on(Db::open(p, store)) {
-        Ok(db) => {
+    match RT.block_on(async {
+        tokio::time::timeout(Duration::from_secs(30), Db::open(p, store)).await
+    }) {
+        Ok(Ok(db)) => {
             eprintln!("[ffi] db opened successfully");
             Box::into_raw(Box::new(DbHandle { db }))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("[ffi] slatedb_open FAILED: {e}");
+            ptr::null_mut()
+        }
+        Err(_) => {
+            eprintln!("[ffi] slatedb_open TIMED OUT after 30s — check credentials, region, and bucket access");
             ptr::null_mut()
         }
     }
