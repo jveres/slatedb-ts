@@ -10,7 +10,7 @@
  * @see https://github.com/slatedb/slatedb/tree/main/slatedb-bencher
  */
 import { parseArgs } from "util";
-import { SlateDB, WriteBatch, IsolationLevel, Transaction } from "./index";
+import { SlateDB, WriteBatch, IsolationLevel, Transaction, type Settings } from "./index";
 
 // ---------------------------------------------------------------------------
 // Stats recorder — port of stats.rs rolling windows
@@ -146,6 +146,18 @@ function cloudWarning(url: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Open DB — with optional settings
+// ---------------------------------------------------------------------------
+async function openDb(path: string, url: string, flushIntervalMs?: number) {
+  if (flushIntervalMs !== undefined) {
+    return SlateDB.openWithSettings(path, url, {
+      flushIntervalMs,
+    } as Settings);
+  }
+  return SlateDB.open(path, url);
+}
+
+// ---------------------------------------------------------------------------
 // Flush + close with progress dots
 // ---------------------------------------------------------------------------
 async function closeDb(db: InstanceType<typeof SlateDB>) {
@@ -206,6 +218,7 @@ async function runDbBench(argv: string[]) {
       "put-percentage":    { type: "string",  default: "20" },
       "get-hit-percentage":{ type: "string",  default: "95" },
       "await-durable":     { type: "boolean", default: false },
+      "flush-interval":    { type: "string" },
       "key-generator":     { type: "string",  default: "fixed-set" },
       help:                { type: "boolean", default: false },
     },
@@ -227,6 +240,7 @@ Options:
   --put-percentage <0-100>  Write ratio (default: 20)
   --get-hit-percentage <0-100>  Get-hit ratio (default: 95)
   --await-durable           Wait for durable writes (default: false)
+  --flush-interval <ms>     WAL flush interval in ms (default: SlateDB default ~100ms)
   --key-generator <type>    "fixed-set" or "random" (default: "fixed-set")
   --help                    Show this help`);
     return;
@@ -241,6 +255,7 @@ Options:
   const PUT_PCT         = parseInt(args["put-percentage"]!);
   const GET_HIT_PCT     = parseInt(args["get-hit-percentage"]!);
   const AWAIT_DURABLE   = args["await-durable"]!;
+  const FLUSH_INTERVAL  = args["flush-interval"] ? parseInt(args["flush-interval"]) : undefined;
   const KEY_GEN         = args["key-generator"]!;
 
   console.log("slatedb-bencher db\n");
@@ -255,6 +270,7 @@ Options:
   console.log(`  put-percentage:   ${PUT_PCT}%`);
   console.log(`  get-hit-pct:      ${GET_HIT_PCT}%`);
   console.log(`  await-durable:    ${AWAIT_DURABLE}`);
+  console.log(`  flush-interval:   ${FLUSH_INTERVAL !== undefined ? `${FLUSH_INTERVAL}ms` : "default"}`);
   console.log(`  key-generator:    ${KEY_GEN}`);
 
   cloudWarning(args.url!);
@@ -262,7 +278,7 @@ Options:
 
   const ts = Date.now();
   const dbPath = `${args.path}/bench_db_${ts}`;
-  const db = await SlateDB.open(dbPath, args.url!);
+  const db = await openDb(dbPath, args.url!, FLUSH_INTERVAL);
   const stats = new StatsRecorder();
   const benchStart = performance.now();
 
@@ -340,6 +356,7 @@ async function runTransactionBench(argv: string[]) {
       "use-write-batch":   { type: "boolean", default: false },
       "isolation-level":   { type: "string",  default: "snapshot" },
       "await-durable":     { type: "boolean", default: false },
+      "flush-interval":    { type: "string" },
       "key-generator":     { type: "string",  default: "fixed-set" },
       help:                { type: "boolean", default: false },
     },
@@ -362,6 +379,7 @@ Options:
   --use-write-batch         Use WriteBatch instead of Transaction (default: false)
   --isolation-level <level> "snapshot" or "serializable" (default: "snapshot")
   --await-durable           Wait for durable writes (default: false)
+  --flush-interval <ms>     WAL flush interval in ms (default: SlateDB default ~100ms)
   --key-generator <type>    "fixed-set" or "random" (default: "fixed-set")
   --help                    Show this help`);
     return;
@@ -379,6 +397,7 @@ Options:
                             ? IsolationLevel.SerializableSnapshot
                             : IsolationLevel.Snapshot;
   const AWAIT_DURABLE   = args["await-durable"]!;
+  const FLUSH_INTERVAL  = args["flush-interval"] ? parseInt(args["flush-interval"]) : undefined;
   const KEY_GEN         = args["key-generator"]!;
 
   console.log("slatedb-bencher transaction\n");
@@ -394,13 +413,14 @@ Options:
   console.log(`  use-write-batch:  ${USE_BATCH}`);
   console.log(`  isolation:        ${args["isolation-level"]}`);
   console.log(`  await-durable:    ${AWAIT_DURABLE}`);
+  console.log(`  flush-interval:   ${FLUSH_INTERVAL !== undefined ? `${FLUSH_INTERVAL}ms` : "default"}`);
   console.log(`  key-generator:    ${KEY_GEN}`);
   cloudWarning(args.url!);
   console.log();
 
   const ts = Date.now();
   const dbPath = `${args.path}/bench_txn_${ts}`;
-  const db = await SlateDB.open(dbPath, args.url!);
+  const db = await openDb(dbPath, args.url!, FLUSH_INTERVAL);
   const stats = new StatsRecorder();
   const benchStart = performance.now();
 
