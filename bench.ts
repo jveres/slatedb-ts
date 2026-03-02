@@ -1,11 +1,9 @@
 /**
  * Micro-benchmark — port of SlateDB's `benches/db_operations.rs` (Criterion).
  *
- * Measures the same two operations:
- *   1. put  (await_durable=false, 1000 samples)
+ * Measures:
+ *   1. put  (await_durable=false)
  *   2. open_close
- *
- * Plus additional bridge-specific benchmarks:
  *   3. get  (hot key)
  *   4. scan (full, 100 keys)
  *
@@ -28,21 +26,20 @@ interface BenchResult {
   opsPerSec: number;
 }
 
-function bench(
+async function bench(
   name: string,
-  fn: () => void,
+  fn: () => Promise<void>,
   samples: number,
   warmup = 50,
-): BenchResult {
-  // warmup
-  for (let i = 0; i < warmup; i++) fn();
+): Promise<BenchResult> {
+  for (let i = 0; i < warmup; i++) await fn();
 
   const times: number[] = new Array(samples);
   const t0 = performance.now();
   for (let i = 0; i < samples; i++) {
     const start = performance.now();
-    fn();
-    times[i] = (performance.now() - start) * 1000; // μs
+    await fn();
+    times[i] = (performance.now() - start) * 1000;
   }
   const totalMs = performance.now() - t0;
 
@@ -79,55 +76,54 @@ function report(r: BenchResult) {
 // ---------------------------------------------------------------------------
 // Benchmarks
 // ---------------------------------------------------------------------------
-console.log("SlateDB Bun FFI — micro-benchmarks\n");
+console.log("SlateDB napi-rs — micro-benchmarks\n");
 console.log("(ported from slatedb/benches/db_operations.rs)\n");
 
-// -- 1. put (matches Criterion bench exactly) --
+const key = Buffer.from("key");
+const value = Buffer.from("value");
+
+// -- 1. put --
 {
-  const db = SlateDB.open("/tmp/bench_put", ":memory:");
+  const db = await SlateDB.open("/tmp/bench_put", ":memory:");
   report(
-    bench(
-      "put (await_durable=false)",
-      () => db.put("key", "value", false),
-      1_000,
-    ),
+    await bench("put (await_durable=false)", () => db.put(key, value, false), 1_000),
   );
-  db.close();
+  await db.close();
 }
 
-// -- 2. open_close (matches Criterion bench exactly) --
+// -- 2. open_close --
 {
   report(
-    bench(
+    await bench(
       "open_close",
-      () => {
-        const db = SlateDB.open("/tmp/bench_open_close", ":memory:");
-        db.close();
+      async () => {
+        const db = await SlateDB.open("/tmp/bench_open_close", ":memory:");
+        await db.close();
       },
       1_000,
     ),
   );
 }
 
-// -- 3. get (bridge-specific: measures FFI round-trip for reads) --
+// -- 3. get --
 {
-  const db = SlateDB.open("/tmp/bench_get", ":memory:");
-  db.put("key", "value");
-  report(bench("get (hot key)", () => db.get("key"), 1_000));
-  db.close();
+  const db = await SlateDB.open("/tmp/bench_get", ":memory:");
+  await db.put(key, value);
+  report(await bench("get (hot key)", () => db.get(key), 1_000));
+  await db.close();
 }
 
-// -- 4. scan (bridge-specific: measures flat-buffer serialization overhead) --
+// -- 4. scan --
 {
-  const db = SlateDB.open("/tmp/bench_scan", ":memory:");
+  const db = await SlateDB.open("/tmp/bench_scan", ":memory:");
   for (let i = 0; i < 100; i++) {
-    db.put(
-      `key_${String(i).padStart(4, "0")}`,
-      `val_${"x".repeat(100)}`,
+    await db.put(
+      Buffer.from(`key_${String(i).padStart(4, "0")}`),
+      Buffer.from(`val_${"x".repeat(100)}`),
       false,
     );
   }
-  db.flush();
-  report(bench("scan (100 keys, ~100B values)", () => db.scan(), 1_000));
-  db.close();
+  await db.flush();
+  report(await bench("scan (100 keys, ~100B values)", () => db.scan(), 1_000));
+  await db.close();
 }

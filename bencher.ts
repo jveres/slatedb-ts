@@ -179,7 +179,7 @@ function printTxnStats(stats: StatsRecorder, benchStart: number) {
 // ---------------------------------------------------------------------------
 // Subcommand: db — port of db.rs
 // ---------------------------------------------------------------------------
-function runDbBench(argv: string[]) {
+async function runDbBench(argv: string[]) {
   const { values: args } = parseArgs({
     args: argv,
     options: {
@@ -231,7 +231,7 @@ Options:
   const AWAIT_DURABLE   = args["await-durable"]!;
   const KEY_GEN         = args["key-generator"]!;
 
-  console.log("slatedb-bencher db (Bun FFI)\n");
+  console.log("slatedb-bencher db\n");
   console.log(`  url:              ${args.url}`);
   console.log(`  path:             ${args.path}`);
   console.log(`  duration:         ${DURATION_S}s`);
@@ -250,7 +250,7 @@ Options:
 
   const ts = Date.now();
   const dbPath = `${args.path}/bench_db_${ts}`;
-  const db = SlateDB.open(dbPath, args.url!);
+  const db = await SlateDB.open(dbPath, args.url!);
   const stats = new StatsRecorder();
   const benchStart = performance.now();
 
@@ -266,19 +266,19 @@ Options:
 
     while (stats.total("puts") < perWorkerRows * (w + 1) && (performance.now() - start) < perWorkerDuration) {
       if (Math.floor(Math.random() * 100) < PUT_PCT) {
-        const key = keyGen.nextKey();
-        const value = randomBytes(VAL_LEN);
+        const key = Buffer.from(keyGen.nextKey());
+        const value = Buffer.from(randomBytes(VAL_LEN));
         try {
-          db.put(key, value, AWAIT_DURABLE);
+          await db.put(key, value, AWAIT_DURABLE);
           puts++;
           putsBytes += VAL_LEN;
         } catch { /* ignore */ }
       } else {
         const key = Math.floor(Math.random() * 100) < GET_HIT_PCT
-          ? keyGen.usedKey()
-          : keyGen.nextKey();
+          ? Buffer.from(keyGen.usedKey())
+          : Buffer.from(keyGen.nextKey());
         try {
-          const val = db.get(key);
+          const val = await db.get(key);
           gets++;
           getsHits += val !== null ? 1 : 0;
           getsBytes += key.byteLength + (val?.byteLength ?? 0);
@@ -308,11 +308,11 @@ Options:
 
   process.stdout.write("Flushing... ");
   const t0 = performance.now();
-  db.flush();
+  await db.flush();
   const flushMs = (performance.now() - t0).toFixed(0);
   process.stdout.write(`${flushMs}ms. Closing... `);
   const t1 = performance.now();
-  db.close();
+  await db.close();
   const closeMs = (performance.now() - t1).toFixed(0);
   console.log(`${closeMs}ms.`);
 }
@@ -320,7 +320,7 @@ Options:
 // ---------------------------------------------------------------------------
 // Subcommand: transaction — port of transactions.rs
 // ---------------------------------------------------------------------------
-function runTransactionBench(argv: string[]) {
+async function runTransactionBench(argv: string[]) {
   const { values: args } = parseArgs({
     args: argv,
     options: {
@@ -377,7 +377,7 @@ Options:
   const AWAIT_DURABLE   = args["await-durable"]!;
   const KEY_GEN         = args["key-generator"]!;
 
-  console.log("slatedb-bencher transaction (Bun FFI)\n");
+  console.log("slatedb-bencher transaction\n");
   console.log(`  url:              ${args.url}`);
   console.log(`  path:             ${args.path}`);
   console.log(`  duration:         ${DURATION_S}s`);
@@ -396,7 +396,7 @@ Options:
 
   const ts = Date.now();
   const dbPath = `${args.path}/bench_txn_${ts}`;
-  const db = SlateDB.open(dbPath, args.url!);
+  const db = await SlateDB.open(dbPath, args.url!);
   const stats = new StatsRecorder();
   const benchStart = performance.now();
 
@@ -419,12 +419,12 @@ Options:
         } else {
           const batch = new WriteBatch();
           for (let i = 0; i < TXN_SIZE; i++) {
-            const key = keyGen.nextKey();
-            const value = randomBytes(VAL_LEN);
-            batch.put(key, value);
+            const key = Buffer.from(keyGen.nextKey());
+            const value = Buffer.from(randomBytes(VAL_LEN));
+            await batch.put(key, value);
           }
           try {
-            db.writeBatch(batch, AWAIT_DURABLE);
+            await db.writeBatch(batch, AWAIT_DURABLE);
             commits++;
             totalOps += TXN_SIZE;
           } catch {
@@ -433,9 +433,9 @@ Options:
         }
       } else {
         // Transaction path
-        let txn: Transaction;
+        let txn: any;
         try {
-          txn = db.begin(ISOLATION);
+          txn = await db.begin(ISOLATION);
         } catch {
           conflicts++;
           continue;
@@ -443,12 +443,12 @@ Options:
 
         let txnOk = true;
         for (let i = 0; i < TXN_SIZE; i++) {
-          const key = keyGen.nextKey();
-          const value = randomBytes(VAL_LEN);
+          const key = Buffer.from(keyGen.nextKey());
+          const value = Buffer.from(randomBytes(VAL_LEN));
           try {
-            txn.put(key, value);
+            await txn.put(key, value);
           } catch {
-            txn.rollback();
+            await txn.rollback();
             txnOk = false;
             aborts++;
             break;
@@ -458,11 +458,11 @@ Options:
         if (!txnOk) continue;
 
         if (shouldAbort) {
-          txn.rollback();
+          await txn.rollback();
           aborts++;
         } else {
           try {
-            txn.commit(AWAIT_DURABLE);
+            await txn.commit(AWAIT_DURABLE);
             commits++;
             totalOps += TXN_SIZE;
           } catch {
@@ -495,14 +495,14 @@ Options:
   console.log(`\nBench done in ${benchS}s — commits: ${stats.total("commits")}, aborts: ${stats.total("aborts")}, conflicts: ${stats.total("conflicts")}, ops: ${stats.total("totalOps")}`);
 
   process.stdout.write("Flushing... ");
-  const t0 = performance.now();
-  db.flush();
-  const flushMs = (performance.now() - t0).toFixed(0);
-  process.stdout.write(`${flushMs}ms. Closing... `);
-  const t1 = performance.now();
-  db.close();
-  const closeMs = (performance.now() - t1).toFixed(0);
-  console.log(`${closeMs}ms.`);
+  const t0b = performance.now();
+  await db.flush();
+  const flushMsB = (performance.now() - t0b).toFixed(0);
+  process.stdout.write(`${flushMsB}ms. Closing... `);
+  const t1b = performance.now();
+  await db.close();
+  const closeMsB = (performance.now() - t1b).toFixed(0);
+  console.log(`${closeMsB}ms.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +511,7 @@ Options:
 const subcommand = process.argv[2];
 
 if (!subcommand || subcommand === "--help" || subcommand === "-h") {
-  console.log(`slatedb-bencher — port of slatedb-bencher (Bun FFI)
+  console.log(`slatedb-bencher — port of slatedb-bencher
 
 Subcommands:
   db            Mixed read/write benchmark (put + get)
@@ -523,7 +523,7 @@ Usage:
   bun run bencher.ts <subcommand> --help   Show subcommand options
 
 Note: The \`compaction\` subcommand is not ported — it requires
-internal Rust APIs (CompactionExecuteBench) not exposed through FFI.`);
+internal Rust APIs (CompactionExecuteBench) not exposed via napi-rs.`);
   process.exit(0);
 }
 
@@ -531,10 +531,10 @@ const subArgv = process.argv.slice(3);
 
 switch (subcommand) {
   case "db":
-    runDbBench(subArgv);
+    await runDbBench(subArgv);
     break;
   case "transaction":
-    runTransactionBench(subArgv);
+    await runTransactionBench(subArgv);
     break;
   default:
     console.error(`Unknown subcommand: ${subcommand}`);

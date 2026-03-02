@@ -1,19 +1,27 @@
 # slatedb-ts
 
-Tiny native [Bun](https://bun.sh) FFI bridge to [SlateDB](https://slatedb.io) — a cloud-native embedded storage engine built on object storage (S3, Azure Blob, GCS, local filesystem, MinIO, …).
+Async native [napi-rs](https://napi.rs) bridge to [SlateDB](https://slatedb.io) — a cloud-native embedded storage engine built on object storage (S3, Azure Blob, GCS, R2, MinIO, local filesystem, …).
+
+Works on **Node.js** and **Bun** (N-API compatible).
 
 ## Prerequisites
 
-- **Bun** ≥ 1.3
+- **Node.js** ≥ 18 or **Bun** ≥ 1.3
 - **Rust** ≥ 1.85 (stable)
 
 ## Build
 
 ```bash
 cargo build --release
+cp target/release/libslatedb_napi.dylib slatedb_napi.darwin-arm64.node  # macOS arm64
+# cp target/release/libslatedb_napi.so slatedb_napi.linux-x64-gnu.node  # Linux x64
 ```
 
-Produces `target/release/libslatedb_ffi.{dylib,so,dll}` (~4 MB).
+Or use the shorthand:
+
+```bash
+bun run build   # or: npm run build
+```
 
 The Cargo crate includes `aws` and `azure` features by default. To build without cloud backends (smaller binary):
 
@@ -27,49 +35,53 @@ cargo build --release --no-default-features --features moka
 import { SlateDB, WriteBatch, Transaction, IsolationLevel } from "./index";
 
 // Open — in-memory, local filesystem, or cloud
-const db = SlateDB.open("/my-db", ":memory:");
-// const db = SlateDB.open("/my-db", "file:///tmp/slate");
-// const db = SlateDB.open("/my-db", "s3://my-bucket");
+const db = await SlateDB.open("/my-db", ":memory:");
+// const db = await SlateDB.open("/my-db", "file:///tmp/slate");
+// const db = await SlateDB.open("/my-db", "s3://my-bucket");
 
-// Put / Get
-db.put("hello", "world");
-db.getString("hello"); // "world"
+// Put / Get — all async, never blocks the main thread
+await db.put(Buffer.from("hello"), Buffer.from("world"));
+const val = await db.getString(Buffer.from("hello")); // "world"
 
 // Binary keys & values
-db.put(new Uint8Array([1, 2]), new Uint8Array([3, 4]));
-db.get(new Uint8Array([1, 2])); // Uint8Array [3, 4]
+await db.put(Buffer.from([1, 2]), Buffer.from([3, 4]));
+const got = await db.get(Buffer.from([1, 2])); // Buffer [3, 4]
 
 // Fire-and-forget writes (skip durability wait)
-db.put("fast", "write", false);
+await db.put(Buffer.from("fast"), Buffer.from("write"), false);
 
 // Range scan [start, end)
-db.scan("a", "z"); // KeyValue[]
+const items = await db.scan(Buffer.from("a"), Buffer.from("z")); // KeyValue[]
 
 // Full scan
-db.scan();
+const all = await db.scan();
 
 // Write batch — atomic multi-put
 const batch = new WriteBatch();
-batch.put("k1", "v1").put("k2", "v2").delete("old");
-db.writeBatch(batch);
+await batch.put(Buffer.from("k1"), Buffer.from("v1"));
+await batch.put(Buffer.from("k2"), Buffer.from("v2"));
+await batch.delete(Buffer.from("old"));
+await db.writeBatch(batch);
 
 // Transaction — ACID with conflict detection
-const txn = db.begin(IsolationLevel.Snapshot);
-txn.put("account_a", "900");
-txn.put("account_b", "1100");
-const val = txn.getString("account_a"); // read-your-writes
-txn.commit();
-// txn.rollback();                      // or abort
+const txn = await db.begin(IsolationLevel.Snapshot);
+await txn.put(Buffer.from("account_a"), Buffer.from("900"));
+await txn.put(Buffer.from("account_b"), Buffer.from("1100"));
+const balance = await txn.getString(Buffer.from("account_a")); // read-your-writes
+await txn.commit();
+// await txn.rollback();  // or abort
 
 // Delete, flush, close
-db.delete("hello");
-db.flush();
-db.close();
+await db.delete(Buffer.from("hello"));
+await db.flush();
+await db.close();
 ```
 
 ## API
 
-### `SlateDB.open(path, url?)`
+All operations are **async** and return Promises. The main thread is never blocked — backpressure from cloud backends (S3 flush) is handled by the Tokio runtime on background threads.
+
+### `await SlateDB.open(path, url?)`
 
 Open a database. `path` is the logical key prefix inside the store. `url` selects the backend (defaults to `":memory:"`).
 
@@ -83,7 +95,7 @@ Open a database. `path` is the logical key prefix inside the store. `url` select
 | `az://container` | Azure Blob Storage   | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY`                      |
 | `gs://bucket`    | Google Cloud Storage | `GOOGLE_SERVICE_ACCOUNT`                                                       |
 
-For S3-compatible backends (AWS, R2, MinIO), credentials are loaded via [`AmazonS3Builder::from_env()`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env) with `S3ConditionalPut::ETagMatch` (required for SlateDB's manifest fencing). R2 and MinIO support ETag-based conditional puts. For other backends, URL resolution is handled by the Rust [`object_store`](https://docs.rs/object_store) crate. `Db::open()` has a 30-second timeout to prevent hanging on misconfigured backends.
+For S3-compatible backends (AWS, R2, MinIO), credentials are loaded via [`AmazonS3Builder::from_env()`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env) with `S3ConditionalPut::ETagMatch` (required for SlateDB's manifest fencing). R2 and MinIO support ETag-based conditional puts. For other backends, URL resolution is handled by the Rust [`object_store`](https://docs.rs/object_store) crate. `open()` has a 30-second timeout to prevent hanging on misconfigured backends.
 
 **Cloudflare R2 example:**
 
@@ -98,7 +110,7 @@ SLATEDB_TEST_URLS="s3://my-r2-bucket" bun test
 
 > **Coming from the Rust `slatedb-bencher`?** The Rust CLI uses the older `admin::load_object_store_from_env()` API which reads a `CLOUD_PROVIDER` env var. This bridge uses URL strings instead — the mapping is:
 >
-> | Rust `CLOUD_PROVIDER`                        | Bun `url`                                                    |
+> | Rust `CLOUD_PROVIDER`                        | Bridge `url`                                                 |
 > | -------------------------------------------- | ------------------------------------------------------------ |
 > | `CLOUD_PROVIDER=memory`                      | `":memory:"`                                                 |
 > | `CLOUD_PROVIDER=local` + `LOCAL_PATH=/tmp/x` | `"file:///tmp/x"`                                            |
@@ -106,37 +118,37 @@ SLATEDB_TEST_URLS="s3://my-r2-bucket" bun test
 > | `CLOUD_PROVIDER=azure` + `AZURE_*` env vars  | `"az://container"` + same `AZURE_*` env vars                 |
 > | _(not supported)_                             | `"s3://bucket"` + `AWS_ENDPOINT` for R2/MinIO/S3-compatible  |
 
-### `db.put(key, value, awaitDurable?)`
+### `await db.put(key, value, awaitDurable?)`
 
-Insert or update. Keys and values are `string | Uint8Array`.
+Insert or update. Keys and values are `Buffer`.
 
-`awaitDurable` (default `true`) controls whether to block until the write is persisted to object storage. Pass `false` for lower-latency fire-and-forget writes — data is still buffered in-memory and flushed on the next flush interval or explicit `flush()` call.
+`awaitDurable` (default `true`) controls whether to wait for persistence to object storage. Pass `false` for lower-latency fire-and-forget writes — data is still buffered in-memory and flushed on the next flush interval or explicit `flush()` call.
 
-### `db.get(key)` → `Uint8Array | null`
+### `await db.get(key)` → `Buffer | null`
 
 Get raw bytes. Returns `null` if not found.
 
-### `db.getString(key)` → `string | null`
+### `await db.getString(key)` → `string | null`
 
 Convenience — decodes the value as UTF-8.
 
-### `db.delete(key, awaitDurable?)`
+### `await db.delete(key, awaitDurable?)`
 
 Delete a key. `awaitDurable` defaults to `true` (same semantics as `put`).
 
-### `db.scan(start?, end?)` → `KeyValue[]`
+### `await db.scan(start?, end?)` → `KeyValue[]`
 
-Range scan `[start, end)`. Omit both for a full scan. Returns an array of `{ key: Uint8Array, value: Uint8Array }`. Scan results are zero-copy `subarray()` views into a single shared buffer — avoid holding references across `put`/`delete` calls.
+Range scan `[start, end)`. Omit both for a full scan. Returns an array of `{ key: Buffer, value: Buffer }`.
 
-### `db.writeBatch(batch, awaitDurable?)`
+### `await db.writeBatch(batch, awaitDurable?)`
 
 Atomically apply a `WriteBatch`. The batch is consumed and cannot be reused.
 
 ### `new WriteBatch()`
 
-Create a batch. Chain `.put(key, value)` and `.delete(key)` calls. Submit with `db.writeBatch(batch)`. Call `.free()` to discard without writing.
+Create a batch. Chain `await batch.put(key, value)` and `await batch.delete(key)` calls. Submit with `await db.writeBatch(batch)`. Call `await batch.free()` to discard without writing.
 
-### `db.begin(isolation?)`
+### `await db.begin(isolation?)`
 
 Begin an ACID transaction. Returns a `Transaction` object.
 
@@ -144,20 +156,20 @@ Begin an ACID transaction. Returns a `Transaction` object.
 
 ### Transaction methods
 
-| Method                      | Description                                   |
-| --------------------------- | --------------------------------------------- |
-| `txn.put(key, value)`       | Put within the transaction                    |
-| `txn.get(key)`              | Read within the transaction (sees own writes) |
-| `txn.getString(key)`        | Read as UTF-8 string                          |
-| `txn.delete(key)`           | Delete within the transaction                 |
-| `txn.commit(awaitDurable?)` | Commit (throws on conflict)                   |
-| `txn.rollback()`            | Abort the transaction                         |
+| Method                            | Description                                   |
+| --------------------------------- | --------------------------------------------- |
+| `await txn.put(key, value)`       | Put within the transaction                    |
+| `await txn.get(key)`              | Read within the transaction (sees own writes) |
+| `await txn.getString(key)`        | Read as UTF-8 string                          |
+| `await txn.delete(key)`           | Delete within the transaction                 |
+| `await txn.commit(awaitDurable?)` | Commit (throws on conflict)                   |
+| `await txn.rollback()`            | Abort the transaction                         |
 
-### `db.flush()`
+### `await db.flush()`
 
 Force-flush the memtable to object storage.
 
-### `db.close()`
+### `await db.close()`
 
 Close the database and free native resources.
 
@@ -166,7 +178,7 @@ Close the database and free native resources.
 ```typescript
 export { SlateDB, WriteBatch, Transaction, IsolationLevel };
 export default SlateDB;
-export type { KeyValue }; // { key: Uint8Array, value: Uint8Array }
+export type { KeyValue }; // { key: Buffer, value: Buffer }
 ```
 
 ## Compaction
@@ -197,50 +209,26 @@ SLATEDB_TEST_URLS=":memory:,file:///tmp/slate" bun test
 # AWS S3
 SLATEDB_TEST_URLS="s3://my-bucket" bun test
 
-# Azure Blob Storage
-SLATEDB_TEST_URLS="az://my-container" bun test
-
 # Cloudflare R2 (set AWS_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION=auto)
 SLATEDB_TEST_URLS="s3://my-r2-bucket" bun test
+
+# Azure Blob Storage
+SLATEDB_TEST_URLS="az://my-container" bun test
 ```
 
 Every backend listed in `SLATEDB_TEST_URLS` (comma-separated) gets the full 23-test suite. Each run uses unique timestamped paths to avoid collisions on persistent stores.
 
-**Cloud backend design:** Tests share one DB per group (`beforeAll`/`afterAll`) to minimize object store round-trips — `SlateDB.open()` and `db.close()` each perform multiple S3 operations (manifest, fencing, flush). All writes use `awaitDurable=false` with explicit `flush()` where needed. This matches SlateDB's own cloud-compatible integration test ([`tests/db.rs`](https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs)). Non-durable writes land in the memtable immediately and are visible within the same process — no flush needed for read-after-write consistency.
+**Cloud backend design:** Tests share one DB per group (`beforeAll`/`afterAll`) to minimize object store round-trips — `open()` and `close()` each perform multiple S3 operations (manifest, fencing, flush). All writes use `awaitDurable=false` with explicit `flush()` where needed. This matches SlateDB's own cloud-compatible integration test ([`tests/db.rs`](https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs)). Non-durable writes land in the memtable immediately and are visible within the same process — no flush needed for read-after-write consistency.
 
 ## Benchmark
 
 ### Micro-benchmark
 
-Ported from SlateDB's [`benches/db_operations.rs`](https://github.com/slatedb/slatedb/blob/main/slatedb/benches/db_operations.rs) (Criterion). A matching native Rust bench (`native_bench.rs`) runs the same workloads for direct comparison.
+Ported from SlateDB's [`benches/db_operations.rs`](https://github.com/slatedb/slatedb/blob/main/slatedb/benches/db_operations.rs) (Criterion).
 
 ```bash
-bun run bench                                    # Bun FFI bridge
-cargo run --release --example native_bench       # native Rust
+bun run bench
 ```
-
-Apple Silicon, in-memory backend, same machine back-to-back:
-
-| Benchmark                         | Native Rust (p50) | Bun FFI (p50) | Overhead |
-| --------------------------------- | ----------------- | ------------- | -------- |
-| **put** (non-durable)             | 17.1 μs ¹         | 9.5 μs ¹      | — ¹      |
-| **get** (hot key)                 | 4.3 μs ¹          | 1.7 μs ¹      | — ¹      |
-| **scan** (100 keys, ~100B values) | 56.9 μs           | 64.2 μs       | **+13%** |
-
-¹ `put` and `get` show the Bun bridge as faster than native Rust — this is a measurement artifact. The native bench calls `block_on` from a bare thread into a multi-thread Tokio runtime, while the FFI library's dedicated runtime has less scheduling contention. The [Criterion bench](https://github.com/slatedb/slatedb/blob/main/slatedb/benches/db_operations.rs) (which uses `b.to_async(&runtime)`) reports `put` at 9.3 μs — matching the FFI bridge exactly.
-
-**Scan is the only benchmark where FFI overhead is measurable.** Profiling the 7 μs delta:
-
-```
-                                                  p50
-rust iterate only (baseline)                    58.0 μs
-+ serialize flat buffer in Rust                 59.2 μs   +1.2 μs
-+ alloc Uint8Array + memcpy into JS             61.3 μs   +2.1 μs
-+ decode u32 length headers                     62.2 μs   +0.9 μs
-+ 100 KeyValue objects + subarray()             67.0 μs   +4.8 μs
-```
-
-96% of scan wall time is in SlateDB's own iterator. The bridge adds ~9 μs total: 4 μs for serialization + memcpy + decode, and 5 μs for JS object allocation (`subarray` views + `{key, value}` objects). This is at the physical minimum for the current API shape.
 
 ### Sustained throughput (slatedb-bencher)
 
@@ -257,7 +245,7 @@ bun run bencher -- db --url "s3://my-bucket" --duration 60
 
 # transaction subcommand
 bun run bencher -- transaction --duration 30
-bun run bencher -- transaction --use-write-batch        # WriteBatch comparison
+bun run bencher -- transaction --use-write-batch
 bun run bencher -- transaction --isolation-level serializable
 
 # any backend via --url
@@ -272,78 +260,49 @@ bun run bencher:db                                      # = bencher.ts db
 bun run bencher:txn                                     # = bencher.ts transaction
 ```
 
-**`db` subcommand** — steady-state at 20s, concurrency=1, 1KB values, in-memory:
-
-| Metric        | Rust bencher | Bun bencher |
-| ------------- | ------------ | ----------- |
-| **put/s**     | 4,102        | 19,268      |
-| **get/s**     | 16,399       | 77,150      |
-| **put MiB/s** | 4.0          | 18.8        |
-| **get MiB/s** | 14.0         | 72.6        |
-
-The Bun bridge shows ~4× higher throughput than the Rust bencher for `db`. This is **not** an FFI advantage — it's a structural difference in async scheduling. The Rust bencher uses `tokio::spawn` + `.await` per operation (scheduling overhead per put/get). The FFI bridge calls `block_on` synchronously — zero scheduler hops.
-
-**`transaction` subcommand** — 10s, concurrency=1, 10 ops/txn, 10% abort:
-
-| Metric          | Rust bencher | Bun bencher |
-| --------------- | ------------ | ----------- |
-| **commit/s**    | 19,947       | 19,936      |
-| **ops/s**       | 199,470      | 199,361     |
-| **abort ratio** | 10.1%        | 10.0%       |
-| **conflicts**   | 0            | 0           |
-
-Transaction throughput is at **exact parity** — the `begin`/`put`/`commit` path has identical per-operation cost across both runtimes.
-
-> **Cloud backends (S3/R2/Azure):** On object stores, the memtable flusher writes SSTs over the network. When writes outpace upload speed, SlateDB applies backpressure — `put()` blocks until a memtable slot frees up. Since the FFI uses synchronous `block_on`, this freezes the Bun main thread (no stats output during the stall). This is expected — reduce `--val-len` or `--put-percentage` for smoother throughput on cloud backends. The Rust bencher handles this more gracefully because Tokio's async scheduler can interleave flushes with stats printing.
->
 > **Note:** The `compaction` subcommand is not ported — it requires `CompactionExecuteBench`, an internal Rust struct that directly manipulates SSTs for synthetic benchmarking. It is not part of the normal database workflow (see [Compaction](#compaction)).
 
 ## Architecture
 
 ```
-┌─────────────┐    bun:ffi     ┌──────────────────┐     ┌────────────────┐
-│  TypeScript │ ──────────▶    │  libslatedb_ffi  │ ──▶ │    SlateDB     │
-│  (index.ts) │  C ABI ptrs    │  (Rust cdylib)   │     │  (Rust crate)  │
+┌─────────────┐    N-API       ┌──────────────────┐     ┌────────────────┐
+│  TypeScript │ ──────────▶    │  slatedb_napi    │ ──▶ │    SlateDB     │
+│  (index.ts) │  JS classes    │  (napi-rs cdylib)│     │  (Rust crate)  │
 └─────────────┘                └──────────────────┘     └────────────────┘
-  SlateDB                       28 extern "C" fns          Db, DbTransaction,
-  WriteBatch                    opaque handles:            WriteBatch,
-  Transaction                    DbHandle                  IsolationLevel
-  IsolationLevel                 BufHandle
-                                 ScanHandle                      │
-                                 WriteBatch*                object_store
-                                 DbTransaction*                  │
+  SlateDB                       #[napi] classes:           Db, DbTransaction,
+  WriteBatch                     SlateDB                   WriteBatch,
+  Transaction                    JsWriteBatch              IsolationLevel
+  IsolationLevel                 JsTransaction
+                                                                │
+                                 async fn → Promise        object_store
+                                 Tokio runtime (napi-rs)         │
                                                     ┌──────────────────────┐
-                                                    │ S3 / Azure / GCS /   │
-                                                    │ Filesystem / Memory  │
+                                                    │ S3 / R2 / Azure /    │
+                                                    │ GCS / FS / Memory    │
                                                     └──────────────────────┘
 ```
 
-The Rust layer (`src/lib.rs`) exposes 28 `extern "C"` functions organized in 6 groups:
+The Rust layer (`src/lib.rs`) exposes native JS classes via napi-rs `#[napi]` macros:
 
-| Group           | Functions                                                                     | Purpose                                        |
-| --------------- | ----------------------------------------------------------------------------- | ---------------------------------------------- |
-| **Lifecycle**   | `open`, `close`                                                               | Database open/close                            |
-| **KV ops**      | `put`, `get`, `delete`, `flush`                                               | Core key-value operations                      |
-| **Scan**        | `scan`, `scan_count`, `scan_count_only`, `scan_ptr`, `scan_len`, `scan_copy`, `scan_free` | Range iteration with flat-buffer serialization |
-| **Buf**         | `buf_ptr`, `buf_len`, `buf_copy`, `buf_free`                                              | Safe value retrieval into JS-owned memory      |
-| **WriteBatch**  | `batch_new`, `batch_put`, `batch_delete`, `batch_write`, `batch_free`         | Atomic batch writes                            |
-| **Transaction** | `txn_begin`, `txn_put`, `txn_get`, `txn_delete`, `txn_commit`, `txn_rollback` | ACID transactions                              |
+| Class             | Methods                                            | Purpose                     |
+| ----------------- | -------------------------------------------------- | --------------------------- |
+| **SlateDB**       | `open`, `close`, `put`, `get`, `getString`, `delete`, `flush`, `scan`, `writeBatch`, `begin` | Database lifecycle + KV ops |
+| **WriteBatch**    | `new`, `put`, `delete`, `free`                     | Atomic batch writes         |
+| **Transaction**   | `put`, `get`, `getString`, `delete`, `commit`, `rollback` | ACID transactions           |
 
-A process-global Tokio runtime drives SlateDB's async operations via `block_on`. The TypeScript layer loads the shared library with `bun:ffi` `dlopen` and wraps pointer management into clean classes.
-
-**Memory safety:** Data never crosses the FFI boundary via Bun's `toBuffer` (which creates GC-unsafe views into native memory). Instead, Rust copies directly into JS-owned `Uint8Array` buffers via dedicated `_copy` functions. Scan results use zero-copy `subarray()` views into the copied buffer.
+All async Rust futures are automatically converted to JS Promises by napi-rs. The Tokio runtime is managed internally — no manual `block_on` calls, no main-thread blocking. Backpressure from cloud backends (S3 flush waits) is handled entirely on background threads.
 
 ## Project structure
 
 ```
-├── Cargo.toml         Rust crate — cdylib linking slatedb + object_store (aws, azure)
+├── Cargo.toml         Rust crate — napi-rs + slatedb + object_store (aws, azure)
+├── build.rs           napi-build setup
 ├── bunfig.toml        Bun config — 30s test timeout for cloud backends
-├── src/lib.rs         C ABI FFI layer — 28 functions (db, batch, transaction, scan)
-├── index.ts           TypeScript classes — SlateDB, WriteBatch, Transaction, IsolationLevel
+├── src/lib.rs         napi-rs native classes — SlateDB, WriteBatch, Transaction
+├── index.ts           Native module loader + re-exports
 ├── test.spec.ts       Integration tests — 23 tests across 4 groups, multi-backend
-├── bench.ts           Micro-benchmark — ported from Criterion bench (put, get, scan, open_close)
-├── bencher.ts         Sustained throughput — ported slatedb-bencher (db + transaction subcommands)
-├── native_bench.rs    Matching native Rust bench for parity comparison
+├── bench.ts           Micro-benchmark — ported from Criterion bench (put, get, scan)
+├── bencher.ts         Sustained throughput — ported slatedb-bencher (db + transaction)
 ├── package.json       Scripts: build, test, bench, bencher, bencher:db, bencher:txn
 └── .gitignore
 ```

@@ -1,6 +1,5 @@
 [test]
 # Extended timeout for cloud backends (S3, Azure, GCS).
-# SlateDB.open() and db.close() each perform multiple object store round-trips
-# (manifest read/create, fencing, flush). Bun's test timeout cannot interrupt
-# FFI block_on calls, but this prevents false timeouts between tests.
+# SlateDB.open() and db.close() perform multiple object store round-trips
+# (manifest read/create, fencing, flush).
 timeout = 30000
