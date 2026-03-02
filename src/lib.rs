@@ -1,5 +1,7 @@
 use object_store::memory::InMemory;
+use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
+use object_store::prefix::PrefixStore;
 use once_cell::sync::Lazy;
 use slatedb::config::{PutOptions, WriteOptions};
 use slatedb::{Db, DbTransaction, IsolationLevel, WriteBatch};
@@ -46,10 +48,39 @@ fn cstr_to_str<'a>(s: *const c_char) -> &'a str {
     unsafe { CStr::from_ptr(s).to_str().unwrap_or("") }
 }
 
+/// Resolve an object store from a URL string.
+///
+/// Supported schemes:
+///   `:memory:`       — in-memory (default)
+///   `file:///path`   — local filesystem
+///   `s3://bucket`    — AWS S3 (reads AWS_* env vars via AmazonS3Builder::from_env)
+///   `az://container` — Azure Blob (reads AZURE_* env vars)
+///
+/// For S3 we use `AmazonS3Builder::from_env()` with `S3ConditionalPut::ETagMatch`,
+/// matching SlateDB's own bencher (`admin::load_aws`). The generic
+/// `Db::resolve_object_store` lowercases env vars for `parse_url_opts` which can
+/// misconfigure the client.
 fn resolve_store(url: *const c_char) -> Arc<dyn ObjectStore> {
     let u = cstr_to_str(url);
     if u.is_empty() || u == ":memory:" {
         Arc::new(InMemory::new())
+    } else if u.starts_with("s3://") {
+        use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+        let bucket = u.strip_prefix("s3://").unwrap().trim_end_matches('/');
+        let store = AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()
+            .expect("failed to build S3 store");
+        Arc::new(store)
+    } else if u.starts_with("az://") || u.starts_with("azure://") {
+        // Fall back to generic resolver for Azure/GCS
+        Db::resolve_object_store(u).expect("failed to resolve object store from URL")
+    } else if u.starts_with("file://") {
+        let path = u.strip_prefix("file://").unwrap();
+        let lfs = LocalFileSystem::new_with_prefix(path)
+            .expect("failed to create local filesystem store");
+        Arc::new(lfs)
     } else {
         Db::resolve_object_store(u).expect("failed to resolve object store from URL")
     }
