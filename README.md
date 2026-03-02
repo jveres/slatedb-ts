@@ -33,7 +33,7 @@ cargo build --release --no-default-features --features moka
 
 ```typescript
 import {
-  SlateDB, WriteBatch, IsolationLevel,
+  SlateDB, DbReader, WriteBatch, IsolationLevel,
   DurabilityLevel, FlushType, CheckpointScope,
 } from "./index";
 
@@ -49,8 +49,8 @@ const db2 = await SlateDB.open("/my-db", ":memory:", {
   mergeOperator: "uint64_add",
 });
 
-// Open in read-only mode (multiple readers allowed, no fencing)
-const reader = await SlateDB.open("/my-db", "s3://my-bucket", { readOnly: true });
+// Read-only reader (multiple readers allowed, no fencing)
+const reader = await DbReader.open("/my-db", "s3://my-bucket");
 const val2 = await reader.getString(Buffer.from("hello"));
 const items2 = await reader.scanPrefix(Buffer.from("user:"));
 await reader.close();
@@ -175,11 +175,8 @@ type Settings = {
   maxUnflushedBytes?: number;  // Max unflushed bytes before writer backpressure
   defaultTtlMs?: number;       // Default TTL for put operations (null = no expiry)
   mergeOperator?: string;      // "string_concat" or "uint64_add" (null = no merge)
-  readOnly?: boolean;          // Open as read-only reader (default: false)
 };
 ```
-
-When `readOnly` is true, the database opens as a `DbReader` — a read-only client that doesn't fence writers. Multiple readers can access the same DB path concurrently alongside a single writer. Write operations (`put`, `delete`, `merge`, `flush`, `writeBatch`, `begin`, `snapshot`, `createCheckpoint`) throw with "operation not supported in read-only mode".
 
 > **Coming from the Rust `slatedb-bencher`?** The Rust CLI uses the older `admin::load_object_store_from_env()` API which reads a `CLOUD_PROVIDER` env var. This bridge uses URL strings instead — the mapping is:
 >
@@ -190,6 +187,24 @@ When `readOnly` is true, the database opens as a `DbReader` — a read-only clie
 > | `CLOUD_PROVIDER=aws` + `AWS_*` env vars      | `"s3://bucket"` + same `AWS_*` env vars                      |
 > | `CLOUD_PROVIDER=azure` + `AZURE_*` env vars  | `"az://container"` + same `AZURE_*` env vars                 |
 > | _(not supported)_                             | `"s3://bucket"` + `AWS_ENDPOINT` for R2/MinIO/S3-compatible  |
+
+---
+
+### DbReader
+
+#### `await DbReader.open(path, url?, manifestPollIntervalMs?)`
+
+Open a read-only reader. Multiple readers can access the same DB path concurrently alongside a single writer. The reader does not fence the writer. Reads reflect the persistent state as of when the reader was opened.
+
+| Method | Description |
+| --- | --- |
+| `await reader.get(key, durabilityLevel?)` | Get raw bytes |
+| `await reader.getString(key, durabilityLevel?)` | Get as UTF-8 string |
+| `await reader.scan(start?, end?, durabilityLevel?, readAheadBytes?, maxFetchTasks?)` | Range scan |
+| `await reader.scanPrefix(prefix, durabilityLevel?, readAheadBytes?, maxFetchTasks?)` | Prefix scan |
+| `await reader.close()` | Close the reader |
+
+> **Note:** There is a [known upstream bug](https://github.com/slatedb/slatedb/issues/1331) in SlateDB where the internal manifest poller does not refresh the reader's state. The reader currently sees a snapshot as of when it was opened. To pick up new writes, close and re-open the reader.
 
 ---
 
@@ -338,8 +353,8 @@ Close the database and free native resources. Flushes pending data before closin
 ### Exports
 
 ```typescript
-export { SlateDB, WriteBatch, Transaction, Snapshot, IsolationLevel,
-         DurabilityLevel, FlushType, CheckpointScope };
+export { SlateDB, DbReader, WriteBatch, Transaction, Snapshot,
+         IsolationLevel, DurabilityLevel, FlushType, CheckpointScope };
 export default SlateDB;
 export type { KeyValue, Settings, CheckpointResult, Metric };
 ```
@@ -350,7 +365,7 @@ Compaction is **fully automatic**. When `SlateDB.open()` is called, SlateDB spaw
 
 ## Test
 
-Integration tests are organized in 14 groups — 52 tests total:
+Integration tests are organized in 16 groups — 52 tests total:
 
 | Group                   | Tests | Description                                                    |
 | ----------------------- | ----: | -------------------------------------------------------------- |
@@ -369,7 +384,7 @@ Integration tests are organized in 14 groups — 52 tests total:
 | **checkpoint**          |     2 | Create with defaults, create with name and lifetime            |
 | **open with settings**  |     2 | Custom settings, unknown merge operator error                  |
 | **getString**           |     3 | DB getString, missing key, transaction getString               |
-| **read-only mode**     |     3 | Reader get/scan, write throws (skipped on `:memory:`)          |
+| **DbReader**            |     3 | Reader get/scan, multiple readers (skipped on `:memory:`)      |
 
 ```bash
 # In-memory (default)
@@ -391,7 +406,7 @@ SLATEDB_TEST_URLS="s3://my-r2-bucket" bun test
 SLATEDB_TEST_URLS="az://my-container" bun test
 ```
 
-Every backend listed in `SLATEDB_TEST_URLS` (comma-separated) gets the full 52-test suite. Each run uses unique timestamped paths to avoid collisions on persistent stores.
+Every backend listed in `SLATEDB_TEST_URLS` (comma-separated) gets the full test suite. Each run uses unique timestamped paths to avoid collisions on persistent stores.
 
 ## Benchmark
 
@@ -460,8 +475,9 @@ bun run bencher:txn                                     # = bencher.ts transacti
 │  TypeScript │ ──────────▶    │  slatedb_napi    │ ──▶ │    SlateDB     │
 │  (index.ts) │  JS classes    │  (napi-rs cdylib)│     │  (Rust crate)  │
 └─────────────┘                └──────────────────┘     └────────────────┘
-  SlateDB                       #[napi] classes:           Db, DbTransaction,
-  WriteBatch                     SlateDB                   WriteBatch,
+  SlateDB                       #[napi] classes:           Db, DbReader,
+  DbReader                       SlateDB                   DbTransaction,
+  WriteBatch                     JsDbReader                WriteBatch,
   Transaction                    JsWriteBatch              DbSnapshot,
   Snapshot                       JsTransaction             IsolationLevel
   IsolationLevel                 JsSnapshot
@@ -479,6 +495,7 @@ The Rust layer (`src/lib.rs`) exposes native JS classes via napi-rs `#[napi]` ma
 | Class             | Methods                                                                         | Purpose                    |
 | ----------------- | ------------------------------------------------------------------------------- | -------------------------- |
 | **SlateDB**       | `open`, `close`, `put`, `get`, `getString`, `delete`, `merge`, `flush`, `scan`, `scanPrefix`, `writeBatch`, `begin`, `snapshot`, `createCheckpoint`, `metrics` | Database lifecycle + all ops |
+| **DbReader**      | `open`, `close`, `get`, `getString`, `scan`, `scanPrefix`                       | Read-only multi-reader     |
 | **WriteBatch**    | `new`, `put`, `merge`, `delete`, `free`                                         | Atomic batch writes        |
 | **Transaction**   | `put`, `get`, `getString`, `delete`, `merge`, `scan`, `scanPrefix`, `commit`, `rollback` | ACID transactions          |
 | **Snapshot**      | `get`, `getString`, `scan`, `scanPrefix`                                        | Read-only point-in-time    |
@@ -491,7 +508,7 @@ All async Rust futures are automatically converted to JS Promises by napi-rs. Th
 ├── Cargo.toml         Rust crate — napi-rs + slatedb + object_store (aws, azure)
 ├── build.rs           napi-build setup
 ├── bunfig.toml        Bun config — 30s test timeout for cloud backends
-├── src/lib.rs         napi-rs native classes (SlateDB, WriteBatch, Transaction, Snapshot)
+├── src/lib.rs         napi-rs native classes (SlateDB, DbReader, WriteBatch, Transaction, Snapshot)
 ├── index.ts           Native module loader + re-exports
 ├── test.spec.ts       Integration tests — 52 tests across 14 groups, multi-backend
 ├── bench.ts           Micro-benchmark — comparison against SlateDB's Criterion bench

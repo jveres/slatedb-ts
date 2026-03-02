@@ -49,6 +49,9 @@ export const Transaction = native.Transaction;
 /** Snapshot — read-only point-in-time view of the database. */
 export const Snapshot = native.Snapshot;
 
+/** DbReader — read-only multi-reader access (no fencing). */
+export const DbReader = native.DbReader;
+
 /** Isolation levels for transactions. */
 export const IsolationLevel = native.JsIsolationLevel;
 
@@ -74,7 +77,6 @@ export type Settings = {
   maxUnflushedBytes?: number;
   defaultTtlMs?: number;
   mergeOperator?: "string_concat" | "uint64_add";
-  readOnly?: boolean;
 };
 
 export type CheckpointResult = {

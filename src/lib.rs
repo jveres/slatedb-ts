@@ -263,41 +263,14 @@ pub struct JsSettings {
     pub default_ttl_ms: Option<u32>,
     /// Merge operator: "string_concat" or "uint64_add". Null = no merge support.
     pub merge_operator: Option<String>,
-    /// Open in read-only mode. Multiple readers can access the same DB concurrently.
-    pub read_only: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
 // SlateDB class
 // ---------------------------------------------------------------------------
-enum DbKind {
-    Writer(Db),
-    Reader(Box<DbReader>),
-}
-
 #[napi]
 pub struct SlateDB {
-    inner: DbKind,
-}
-
-impl SlateDB {
-    fn db(&self) -> Result<&Db> {
-        match &self.inner {
-            DbKind::Writer(db) => Ok(db),
-            DbKind::Reader(_) => Err(Error::from_reason(
-                "operation not supported in read-only mode",
-            )),
-        }
-    }
-
-    fn db_mut(&mut self) -> Result<&mut Db> {
-        match &mut self.inner {
-            DbKind::Writer(db) => Ok(db),
-            DbKind::Reader(_) => Err(Error::from_reason(
-                "operation not supported in read-only mode",
-            )),
-        }
-    }
+    inner: Db,
 }
 
 #[napi]
@@ -319,23 +292,6 @@ impl SlateDB {
             probe_store(&store).await?;
         }
 
-        let read_only = settings.as_ref().and_then(|s| s.read_only).unwrap_or(false);
-
-        // Read-only mode — open a DbReader (no fencing, multiple allowed)
-        if read_only {
-            let reader = tokio::time::timeout(
-                Duration::from_secs(30),
-                DbReader::open(path.as_str(), store, None, DbReaderOptions::default()),
-            )
-            .await
-            .map_err(|_| Error::from_reason("SlateDB.open timed out"))?
-            .map_err(to_napi_err)?;
-            return Ok(SlateDB {
-                inner: DbKind::Reader(Box::new(reader)),
-            });
-        }
-
-        // Writer mode
         let inner = match settings {
             Some(settings) => {
                 let mut cfg = Settings::default();
@@ -369,19 +325,15 @@ impl SlateDB {
                 cfg.merge_operator = merge_op;
 
                 let builder = Db::builder(path.as_str(), store).with_settings(cfg);
-                DbKind::Writer(
-                    tokio::time::timeout(Duration::from_secs(30), builder.build())
-                        .await
-                        .map_err(|_| Error::from_reason("SlateDB.open timed out"))?
-                        .map_err(to_napi_err)?,
-                )
-            }
-            None => DbKind::Writer(
-                tokio::time::timeout(Duration::from_secs(30), Db::open(path.as_str(), store))
+                tokio::time::timeout(Duration::from_secs(30), builder.build())
                     .await
                     .map_err(|_| Error::from_reason("SlateDB.open timed out"))?
-                    .map_err(to_napi_err)?,
-            ),
+                    .map_err(to_napi_err)?
+            }
+            None => tokio::time::timeout(Duration::from_secs(30), Db::open(path.as_str(), store))
+                .await
+                .map_err(|_| Error::from_reason("SlateDB.open timed out"))?
+                .map_err(to_napi_err)?,
         };
         Ok(SlateDB { inner })
     }
@@ -403,7 +355,7 @@ impl SlateDB {
         await_durable: Option<bool>,
         ttl: Option<u32>,
     ) -> Result<()> {
-        self.db_mut()?
+        self.inner
             .put_with_options(
                 &key[..],
                 &value[..],
@@ -421,7 +373,7 @@ impl SlateDB {
     /// napi-rs prevents concurrent mutable access from JavaScript.
     #[napi]
     pub async unsafe fn delete(&mut self, key: Buffer, await_durable: Option<bool>) -> Result<()> {
-        self.db_mut()?
+        self.inner
             .delete_with_options(&key[..], wo(await_durable))
             .await
             .map_err(to_napi_err)
@@ -452,7 +404,7 @@ impl SlateDB {
                 Some(ms) => Ttl::ExpireAfter(ms),
             },
         };
-        self.db_mut()?
+        self.inner
             .merge_with_options(&key[..], &value[..], &merge_opts, wo(await_durable))
             .await
             .map_err(to_napi_err)
@@ -470,11 +422,11 @@ impl SlateDB {
         read_level: Option<JsDurabilityLevel>,
     ) -> Result<Option<Buffer>> {
         let opts = build_read_options(read_level);
-        let result = match &self.inner {
-            DbKind::Writer(db) => db.get_with_options(&key[..], &opts).await,
-            DbKind::Reader(r) => r.get_with_options(&key[..], &opts).await,
-        }
-        .map_err(to_napi_err)?;
+        let result = self
+            .inner
+            .get_with_options(&key[..], &opts)
+            .await
+            .map_err(to_napi_err)?;
         match result {
             Some(val) => Ok(Some(Buffer::from(val.to_vec()))),
             None => Ok(None),
@@ -489,11 +441,11 @@ impl SlateDB {
         read_level: Option<JsDurabilityLevel>,
     ) -> Result<Option<String>> {
         let opts = build_read_options(read_level);
-        let result = match &self.inner {
-            DbKind::Writer(db) => db.get_with_options(&key[..], &opts).await,
-            DbKind::Reader(r) => r.get_with_options(&key[..], &opts).await,
-        }
-        .map_err(to_napi_err)?;
+        let result = self
+            .inner
+            .get_with_options(&key[..], &opts)
+            .await
+            .map_err(to_napi_err)?;
         match result {
             Some(val) => {
                 let s = String::from_utf8(val.to_vec())
@@ -520,11 +472,11 @@ impl SlateDB {
     ) -> Result<Vec<KeyValue>> {
         let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
         let range = make_range(&start, &end);
-        let iter = match &self.inner {
-            DbKind::Writer(db) => db.scan_with_options(range, &opts).await,
-            DbKind::Reader(r) => r.scan_with_options(range, &opts).await,
-        }
-        .map_err(to_napi_err)?;
+        let iter = self
+            .inner
+            .scan_with_options(range, &opts)
+            .await
+            .map_err(to_napi_err)?;
         collect_iter(iter).await
     }
 
@@ -538,11 +490,11 @@ impl SlateDB {
         max_fetch_tasks: Option<u32>,
     ) -> Result<Vec<KeyValue>> {
         let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
-        let iter = match &self.inner {
-            DbKind::Writer(db) => db.scan_prefix_with_options(&prefix[..], &opts).await,
-            DbKind::Reader(r) => r.scan_prefix_with_options(&prefix[..], &opts).await,
-        }
-        .map_err(to_napi_err)?;
+        let iter = self
+            .inner
+            .scan_prefix_with_options(&prefix[..], &opts)
+            .await
+            .map_err(to_napi_err)?;
         collect_iter(iter).await
     }
 
@@ -553,7 +505,7 @@ impl SlateDB {
     /// Flush to object storage.
     #[napi]
     pub async fn flush(&self, flush_type: Option<JsFlushType>) -> Result<()> {
-        self.db()?
+        self.inner
             .flush_with_options(build_flush_options(flush_type))
             .await
             .map_err(to_napi_err)
@@ -580,7 +532,7 @@ impl SlateDB {
                 .take()
                 .ok_or_else(|| Error::from_reason("WriteBatch already consumed"))?
         };
-        self.db_mut()?
+        self.inner
             .write_with_options(wb, wo(await_durable))
             .await
             .map_err(to_napi_err)
@@ -597,7 +549,7 @@ impl SlateDB {
             JsIsolationLevel::Snapshot => slatedb::IsolationLevel::Snapshot,
             JsIsolationLevel::SerializableSnapshot => slatedb::IsolationLevel::SerializableSnapshot,
         };
-        let txn = self.db()?.begin(level).await.map_err(to_napi_err)?;
+        let txn = self.inner.begin(level).await.map_err(to_napi_err)?;
         Ok(JsTransaction {
             inner: Mutex::new(Some(txn)),
         })
@@ -610,7 +562,7 @@ impl SlateDB {
     /// Create a read-only point-in-time snapshot.
     #[napi]
     pub async fn snapshot(&self) -> Result<JsSnapshot> {
-        let snap = self.db()?.snapshot().await.map_err(to_napi_err)?;
+        let snap = self.inner.snapshot().await.map_err(to_napi_err)?;
         Ok(JsSnapshot { inner: snap })
     }
 
@@ -636,7 +588,7 @@ impl SlateDB {
             name,
         };
         let result = self
-            .db()?
+            .inner
             .create_checkpoint(s, &opts)
             .await
             .map_err(to_napi_err)?;
@@ -653,7 +605,7 @@ impl SlateDB {
     /// Get database metrics as a flat key-value object.
     #[napi]
     pub fn metrics(&self) -> Result<Vec<JsMetric>> {
-        let registry = self.db()?.metrics();
+        let registry = self.inner.metrics();
         let names = registry.names();
         let mut out = Vec::with_capacity(names.len());
         for name in names {
@@ -678,10 +630,140 @@ impl SlateDB {
     /// napi-rs prevents concurrent mutable access from JavaScript.
     #[napi]
     pub async unsafe fn close(&mut self) -> Result<()> {
-        match &self.inner {
-            DbKind::Writer(db) => db.close().await.map_err(to_napi_err),
-            DbKind::Reader(r) => r.close().await.map_err(to_napi_err),
+        self.inner.close().await.map_err(to_napi_err)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DbReader class — read-only, no fencing, multiple allowed concurrently
+// ---------------------------------------------------------------------------
+#[napi(js_name = "DbReader")]
+pub struct JsDbReader {
+    inner: DbReader,
+}
+
+#[napi]
+impl JsDbReader {
+    /// Open a read-only reader. Multiple readers can access the same DB path
+    /// concurrently alongside a single writer. The reader sees a point-in-time
+    /// snapshot as of when it was opened.
+    ///
+    /// **Note:** Upstream SlateDB has a known bug where the internal manifest
+    /// poller does not refresh the reader's state. To pick up new writes,
+    /// close and re-open the reader.
+    #[napi(factory)]
+    pub async fn open(
+        path: String,
+        url: Option<String>,
+        manifest_poll_interval_ms: Option<u32>,
+    ) -> Result<JsDbReader> {
+        let url = url.unwrap_or_else(|| ":memory:".to_string());
+        let store = resolve_store(&url)?;
+
+        if url.starts_with("s3://") || url.starts_with("az://") || url.starts_with("gs://") {
+            probe_store(&store).await?;
         }
+
+        let mut opts = DbReaderOptions::default();
+        if let Some(ms) = manifest_poll_interval_ms {
+            opts.manifest_poll_interval = Duration::from_millis(ms as u64);
+        }
+
+        let reader = tokio::time::timeout(
+            Duration::from_secs(30),
+            DbReader::open(path.as_str(), store, None, opts),
+        )
+        .await
+        .map_err(|_| Error::from_reason("DbReader.open timed out"))?
+        .map_err(to_napi_err)?;
+
+        Ok(JsDbReader { inner: reader })
+    }
+
+    /// Get raw bytes by key. Returns null if not found.
+    #[napi]
+    pub async fn get(
+        &self,
+        key: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+    ) -> Result<Option<Buffer>> {
+        let opts = build_read_options(read_level);
+        match self
+            .inner
+            .get_with_options(&key[..], &opts)
+            .await
+            .map_err(to_napi_err)?
+        {
+            Some(val) => Ok(Some(Buffer::from(val.to_vec()))),
+            None => Ok(None),
+        }
+    }
+
+    /// Get value as UTF-8 string. Returns null if not found.
+    #[napi(js_name = "getString")]
+    pub async fn get_string(
+        &self,
+        key: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+    ) -> Result<Option<String>> {
+        let opts = build_read_options(read_level);
+        match self
+            .inner
+            .get_with_options(&key[..], &opts)
+            .await
+            .map_err(to_napi_err)?
+        {
+            Some(val) => {
+                let s = String::from_utf8(val.to_vec())
+                    .map_err(|e| Error::from_reason(format!("invalid UTF-8: {e}")))?;
+                Ok(Some(s))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Range scan [start, end). Both bounds optional (full scan if omitted).
+    #[napi]
+    pub async fn scan(
+        &self,
+        start: Option<Buffer>,
+        end: Option<Buffer>,
+        read_level: Option<JsDurabilityLevel>,
+        read_ahead_bytes: Option<u32>,
+        max_fetch_tasks: Option<u32>,
+    ) -> Result<Vec<KeyValue>> {
+        let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
+        let range = make_range(&start, &end);
+        let iter = self
+            .inner
+            .scan_with_options(range, &opts)
+            .await
+            .map_err(to_napi_err)?;
+        collect_iter(iter).await
+    }
+
+    /// Prefix scan — returns all keys starting with the given prefix.
+    #[napi(js_name = "scanPrefix")]
+    pub async fn scan_prefix(
+        &self,
+        prefix: Buffer,
+        read_level: Option<JsDurabilityLevel>,
+        read_ahead_bytes: Option<u32>,
+        max_fetch_tasks: Option<u32>,
+    ) -> Result<Vec<KeyValue>> {
+        let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
+        let iter = self
+            .inner
+            .scan_prefix_with_options(&prefix[..], &opts)
+            .await
+            .map_err(to_napi_err)?;
+        collect_iter(iter).await
+    }
+
+    /// Close the reader and free native resources.
+    #[napi]
+    pub async fn close(&self) -> Result<()> {
+        self.inner.close().await.map_err(to_napi_err)
     }
 }
 

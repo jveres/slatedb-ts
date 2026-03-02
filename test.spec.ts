@@ -10,6 +10,7 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
   SlateDB,
+  DbReader,
   WriteBatch,
   IsolationLevel,
   DurabilityLevel,
@@ -672,11 +673,11 @@ for (const url of urls) {
   });
 
   // =========================================================================
-  // read-only mode (requires persistent backend — skipped for :memory:)
+  // DbReader (requires persistent backend — skipped for :memory:)
   // =========================================================================
-  const skipReadOnly = url === ":memory:";
-  describe(`[${label}] read-only mode`, () => {
-    test.skipIf(skipReadOnly)("reader can read data written by writer", async () => {
+  const skipReader = url === ":memory:";
+  describe(`[${label}] DbReader`, () => {
+    test.skipIf(skipReader)("reader can read data written by writer", async () => {
       const dbPath = uniquePath("ro");
       const writer = await SlateDB.open(dbPath, url);
       await writer.put(Buffer.from("ro_k1"), Buffer.from("v1"));
@@ -684,14 +685,14 @@ for (const url of urls) {
       await writer.flush();
       await writer.close();
 
-      const reader = await SlateDB.open(dbPath, url, { readOnly: true });
+      const reader = await DbReader.open(dbPath, url);
       expect(await reader.getString(Buffer.from("ro_k1"))).toBe("v1");
       expect(await reader.getString(Buffer.from("ro_k2"))).toBe("v2");
       expect(await reader.get(Buffer.from("ro_missing"))).toBeNull();
       await reader.close();
     });
 
-    test.skipIf(skipReadOnly)("reader scan and scanPrefix work", async () => {
+    test.skipIf(skipReader)("reader scan and scanPrefix work", async () => {
       const dbPath = uniquePath("ro_scan");
       const writer = await SlateDB.open(dbPath, url);
       await writer.put(Buffer.from("rs:a"), Buffer.from("1"));
@@ -700,7 +701,7 @@ for (const url of urls) {
       await writer.flush();
       await writer.close();
 
-      const reader = await SlateDB.open(dbPath, url, { readOnly: true });
+      const reader = await DbReader.open(dbPath, url);
       const all = await reader.scan(Buffer.from("rs:"), Buffer.from("rs:~"));
       expect(all).toHaveLength(3);
 
@@ -710,21 +711,19 @@ for (const url of urls) {
       await reader.close();
     });
 
-    test.skipIf(skipReadOnly)("write operations throw in read-only mode", async () => {
-      const dbPath = uniquePath("ro_write");
+    test.skipIf(skipReader)("multiple readers can coexist", async () => {
+      const dbPath = uniquePath("ro_multi");
       const writer = await SlateDB.open(dbPath, url);
-      await writer.put(Buffer.from("x"), Buffer.from("y"));
+      await writer.put(Buffer.from("mk"), Buffer.from("mv"));
       await writer.flush();
       await writer.close();
 
-      const reader = await SlateDB.open(dbPath, url, { readOnly: true });
-      try {
-        await reader.put(Buffer.from("a"), Buffer.from("b"));
-        expect(true).toBe(false); // should not reach
-      } catch (e: any) {
-        expect(e.message).toContain("read-only");
-      }
-      await reader.close();
+      const r1 = await DbReader.open(dbPath, url);
+      const r2 = await DbReader.open(dbPath, url);
+      expect(await r1.getString(Buffer.from("mk"))).toBe("mv");
+      expect(await r2.getString(Buffer.from("mk"))).toBe("mv");
+      await r1.close();
+      await r2.close();
     });
   });
 }
