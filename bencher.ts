@@ -236,13 +236,8 @@ Options:
   console.log(`  await-durable:    ${AWAIT_DURABLE}`);
   console.log(`  key-generator:    ${KEY_GEN}`);
 
-  const isCloud = /^(s3|az|gs):\/\//.test(args.url!);
-  if (isCloud) {
-    const writeMBs = (VAL_LEN * PUT_PCT / 100 * 50_000 / 1_048_576).toFixed(1);
-    console.log(`\n  ⚠ Cloud backend detected. Estimated peak write rate ~${writeMBs} MiB/s.`);
-    console.log(`    If the run stalls, reduce --val-len or --put-percentage to stay`);
-    console.log(`    within S3/R2 upload bandwidth (~25-100 MiB/s single-stream).`);
-    console.log(`    Recommended: --val-len 128 or --put-percentage 5`);
+  if (/^(s3|az|gs):\/\//.test(args.url!)) {
+    console.log(`\n  ⚠ Cloud backend — if the run stalls, reduce --val-len or --put-percentage`);
   }
   console.log();
 
