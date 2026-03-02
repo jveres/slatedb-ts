@@ -62,11 +62,17 @@ fn resolve_store(url: *const c_char) -> Arc<dyn ObjectStore> {
 #[no_mangle]
 pub extern "C" fn slatedb_open(path: *const c_char, url: *const c_char) -> *mut DbHandle {
     let p = cstr_to_str(path);
+    let u = cstr_to_str(url);
+    eprintln!("[ffi] resolving store for '{u}'...");
     let store = resolve_store(url);
+    eprintln!("[ffi] store resolved, opening db at '{p}'...");
     match RT.block_on(Db::open(p, store)) {
-        Ok(db) => Box::into_raw(Box::new(DbHandle { db })),
+        Ok(db) => {
+            eprintln!("[ffi] db opened successfully");
+            Box::into_raw(Box::new(DbHandle { db }))
+        }
         Err(e) => {
-            eprintln!("slatedb_open: {e}");
+            eprintln!("[ffi] slatedb_open FAILED: {e}");
             ptr::null_mut()
         }
     }
