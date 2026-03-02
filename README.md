@@ -49,7 +49,7 @@ const db2 = await SlateDB.openWithSettings("/my-db", ":memory:", {
   mergeOperator: "uint64_add",
 });
 
-// Put / Get — all async, never blocks the main thread
+// Put / Get
 await db.put(Buffer.from("hello"), Buffer.from("world"));
 const val = await db.getString(Buffer.from("hello")); // "world"
 
@@ -110,7 +110,7 @@ await db2.close();
 
 ## API
 
-All operations are **async** and return Promises. The main thread is never blocked — backpressure from cloud backends (S3 flush) is handled by the Tokio runtime on background threads.
+All operations are **async** and return Promises. Backpressure from cloud backends is handled by the Tokio runtime on background threads.
 
 ---
 
@@ -120,17 +120,20 @@ All operations are **async** and return Promises. The main thread is never block
 
 Open a database with default settings. `path` is the logical key prefix inside the store. `url` selects the backend (defaults to `":memory:"`).
 
-| URL scheme       | Backend              | Required env vars                                                              |
-| ---------------- | -------------------- | ------------------------------------------------------------------------------ |
-| `:memory:`       | In-memory            | —                                                                              |
-| `file:///path`   | Local filesystem     | —                                                                              |
-| `s3://bucket`    | AWS S3               | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`                     |
-| `s3://bucket`    | Cloudflare R2        | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT`, `AWS_REGION=auto` |
-| `s3://bucket`    | MinIO                | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT`, `AWS_ALLOW_HTTP` |
-| `az://container` | Azure Blob Storage   | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY`                      |
-| `gs://bucket`    | Google Cloud Storage | `GOOGLE_SERVICE_ACCOUNT`                                                       |
+| URL scheme       | Backend                   | Required env vars                                                              |
+| ---------------- | ------------------------- | ------------------------------------------------------------------------------ |
+| `:memory:`       | In-memory                 | —                                                                              |
+| `file:///path`   | Local filesystem          | —                                                                              |
+| `s3://bucket`    | AWS S3                    | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`                     |
+| `s3://bucket`    | AWS S3 Express One Zone   | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_S3_EXPRESS=true` |
+| `s3://bucket`    | Cloudflare R2             | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT`, `AWS_REGION=auto` |
+| `s3://bucket`    | MinIO                     | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT`, `AWS_ALLOW_HTTP` |
+| `az://container` | Azure Blob Storage        | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY`                      |
+| `gs://bucket`    | Google Cloud Storage      | `GOOGLE_SERVICE_ACCOUNT`                                                       |
 
 For S3-compatible backends (AWS, R2, MinIO), credentials are loaded via [`AmazonS3Builder::from_env()`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env) with `S3ConditionalPut::ETagMatch` (required for SlateDB's manifest fencing). `open()` has a 30-second timeout to prevent hanging on misconfigured backends.
+
+**S3 Express One Zone** (directory buckets) are supported via `AWS_S3_EXPRESS=true`. The bucket name must follow the directory bucket naming convention (`bucket--azid--x-s3`). The `object_store` crate automatically constructs the zonal endpoint and uses `CreateSession` for short-lived session tokens. S3 Express supports `If-Match` conditional puts required for SlateDB's manifest fencing.
 
 **Cloudflare R2 example:**
 
@@ -141,6 +144,17 @@ export AWS_ENDPOINT="https://<account-id>.r2.cloudflarestorage.com"
 export AWS_REGION="auto"
 
 SLATEDB_TEST_URLS="s3://my-r2-bucket" bun test
+```
+
+**S3 Express One Zone example:**
+
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="us-east-1"
+export AWS_S3_EXPRESS=true
+
+bun run bencher -- db --url "s3://my-bucket--use1-az4--x-s3" --duration 30
 ```
 
 #### `await SlateDB.openWithSettings(path, url, settings)`
@@ -454,7 +468,7 @@ The Rust layer (`src/lib.rs`) exposes native JS classes via napi-rs `#[napi]` ma
 | **Transaction**   | `put`, `get`, `getString`, `delete`, `merge`, `scan`, `scanPrefix`, `commit`, `rollback` | ACID transactions          |
 | **Snapshot**      | `get`, `getString`, `scan`, `scanPrefix`                                        | Read-only point-in-time    |
 
-All async Rust futures are automatically converted to JS Promises by napi-rs. The Tokio runtime is managed internally — no manual `block_on` calls, no main-thread blocking. Backpressure from cloud backends (S3 flush waits) is handled entirely on background threads.
+All async Rust futures are automatically converted to JS Promises by napi-rs. The Tokio runtime is managed internally by napi-rs.
 
 ## Project structure
 
