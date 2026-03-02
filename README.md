@@ -230,6 +230,19 @@ Ported from SlateDB's [`benches/db_operations.rs`](https://github.com/slatedb/sl
 bun run bench
 ```
 
+Apple Silicon, in-memory backend, same machine:
+
+| Benchmark                         | SlateDB Criterion | napi-rs (p50) | Overhead |
+| --------------------------------- | ----------------- | ------------- | -------- |
+| **put** (non-durable)             | 9.28 μs           | 13.42 μs      | **+45%** |
+| **open_close**                    | 172.35 μs         | 111.33 μs     | — ¹      |
+| **get** (hot key)                 | —                 | 15.33 μs      | —        |
+| **scan** (100 keys, ~100B values) | —                 | 119.50 μs     | —        |
+
+¹ `open_close` is faster in napi-rs because Criterion uses `b.to_async(&runtime)` which has per-iteration scheduling overhead; the napi-rs Tokio runtime runs the future directly.
+
+The +45% put overhead is the cost of the napi-rs JS↔Rust bridge (Promise creation, Buffer marshalling). Get and scan are not in SlateDB's Criterion suite.
+
 ### Sustained throughput (slatedb-bencher)
 
 Port of [`slatedb-bencher`](https://github.com/slatedb/slatedb/tree/main/slatedb-bencher) — both the `db` and `transaction` subcommands. All options mirror the Rust CLI.
@@ -301,8 +314,8 @@ All async Rust futures are automatically converted to JS Promises by napi-rs. Th
 ├── src/lib.rs         napi-rs native classes — SlateDB, WriteBatch, Transaction
 ├── index.ts           Native module loader + re-exports
 ├── test.spec.ts       Integration tests — 23 tests across 4 groups, multi-backend
-├── bench.ts           Micro-benchmark — ported from Criterion bench (put, get, scan)
-├── bencher.ts         Sustained throughput — ported slatedb-bencher (db + transaction)
+├── bench.ts           Micro-benchmark — comparison against SlateDB's Criterion bench
+├── bencher.ts         Sustained throughput — ported from slatedb-bencher (db + transaction)
 ├── package.json       Scripts: build, test, bench, bencher, bencher:db, bencher:txn
 └── .gitignore
 ```
