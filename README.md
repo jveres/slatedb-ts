@@ -294,6 +294,8 @@ The Bun bridge shows ~4× higher throughput than the Rust bencher for `db`. This
 
 Transaction throughput is at **exact parity** — the `begin`/`put`/`commit` path has identical per-operation cost across both runtimes.
 
+> **Cloud backends (S3/R2/Azure):** On object stores, the memtable flusher writes SSTs over the network. When writes outpace upload speed, SlateDB applies backpressure — `put()` blocks until a memtable slot frees up. Since the FFI uses synchronous `block_on`, this freezes the Bun main thread (no stats output during the stall). This is expected — reduce `--val-len` or `--put-percentage` for smoother throughput on cloud backends. The Rust bencher handles this more gracefully because Tokio's async scheduler can interleave flushes with stats printing.
+>
 > **Note:** The `compaction` subcommand is not ported — it requires `CompactionExecuteBench`, an internal Rust struct that directly manipulates SSTs for synthetic benchmarking. It is not part of the normal database workflow (see [Compaction](#compaction)).
 
 ## Architecture

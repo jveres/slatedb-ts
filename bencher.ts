@@ -265,11 +265,18 @@ Options:
     }
   }
 
-  const totalS = ((performance.now() - benchStart) / 1000).toFixed(1);
-  console.log(`\nDone in ${totalS}s — total puts: ${stats.total("puts")}, total gets: ${stats.total("gets")}`);
+  const benchS = ((performance.now() - benchStart) / 1000).toFixed(1);
+  console.log(`\nBench done in ${benchS}s — total puts: ${stats.total("puts")}, total gets: ${stats.total("gets")}`);
 
+  process.stdout.write("Flushing... ");
+  const t0 = performance.now();
   db.flush();
+  const flushMs = (performance.now() - t0).toFixed(0);
+  process.stdout.write(`${flushMs}ms. Closing... `);
+  const t1 = performance.now();
   db.close();
+  const closeMs = (performance.now() - t1).toFixed(0);
+  console.log(`${closeMs}ms.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -453,11 +460,18 @@ Options:
     }
   }
 
-  const totalS = ((performance.now() - benchStart) / 1000).toFixed(1);
-  console.log(`\nDone in ${totalS}s — commits: ${stats.total("commits")}, aborts: ${stats.total("aborts")}, conflicts: ${stats.total("conflicts")}, ops: ${stats.total("totalOps")}`);
+  const benchS = ((performance.now() - benchStart) / 1000).toFixed(1);
+  console.log(`\nBench done in ${benchS}s — commits: ${stats.total("commits")}, aborts: ${stats.total("aborts")}, conflicts: ${stats.total("conflicts")}, ops: ${stats.total("totalOps")}`);
 
+  process.stdout.write("Flushing... ");
+  const t0 = performance.now();
   db.flush();
+  const flushMs = (performance.now() - t0).toFixed(0);
+  process.stdout.write(`${flushMs}ms. Closing... `);
+  const t1 = performance.now();
   db.close();
+  const closeMs = (performance.now() - t1).toFixed(0);
+  console.log(`${closeMs}ms.`);
 }
 
 // ---------------------------------------------------------------------------
