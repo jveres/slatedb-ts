@@ -391,7 +391,7 @@ for (const url of urls) {
     let db: any;
 
     beforeAll(async () => {
-      db = await SlateDB.openWithSettings(uniquePath("merge_str"), url, {
+      db = await SlateDB.open(uniquePath("merge_str"), url, {
         mergeOperator: "string_concat",
       });
     });
@@ -423,7 +423,7 @@ for (const url of urls) {
     let db: any;
 
     beforeAll(async () => {
-      db = await SlateDB.openWithSettings(uniquePath("merge_u64"), url, {
+      db = await SlateDB.open(uniquePath("merge_u64"), url, {
         mergeOperator: "uint64_add",
       });
     });
@@ -459,7 +459,7 @@ for (const url of urls) {
     let db: any;
 
     beforeAll(async () => {
-      db = await SlateDB.openWithSettings(uniquePath("batch_merge"), url, {
+      db = await SlateDB.open(uniquePath("batch_merge"), url, {
         mergeOperator: "string_concat",
       });
     });
@@ -487,7 +487,7 @@ for (const url of urls) {
     let db: any;
 
     beforeAll(async () => {
-      db = await SlateDB.openWithSettings(uniquePath("txn_scan"), url, {
+      db = await SlateDB.open(uniquePath("txn_scan"), url, {
         mergeOperator: "string_concat",
       });
       await db.put(Buffer.from("ts:a"), Buffer.from("1"), false);
@@ -615,11 +615,11 @@ for (const url of urls) {
   });
 
   // =========================================================================
-  // openWithSettings
+  // open with settings
   // =========================================================================
-  describe(`[${label}] openWithSettings`, () => {
+  describe(`[${label}] open with settings`, () => {
     test("custom flush interval and memtable size", async () => {
-      const db = await SlateDB.openWithSettings(uniquePath("settings"), url, {
+      const db = await SlateDB.open(uniquePath("settings"), url, {
         flushIntervalMs: 500,
         l0SstSizeBytes: 1024 * 1024,
       });
@@ -630,7 +630,7 @@ for (const url of urls) {
 
     test("unknown merge operator throws", async () => {
       try {
-        await SlateDB.openWithSettings(uniquePath("bad_merge"), url, {
+        await SlateDB.open(uniquePath("bad_merge"), url, {
           mergeOperator: "nonexistent" as any,
         });
         expect(true).toBe(false); // should not reach

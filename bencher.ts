@@ -150,9 +150,7 @@ function cloudWarning(url: string) {
 // ---------------------------------------------------------------------------
 async function openDb(path: string, url: string, flushIntervalMs?: number) {
   if (flushIntervalMs !== undefined) {
-    return SlateDB.openWithSettings(path, url, {
-      flushIntervalMs,
-    } as Settings);
+    return SlateDB.open(path, url, { flushIntervalMs } as Settings);
   }
   return SlateDB.open(path, url);
 }

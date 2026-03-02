@@ -43,7 +43,7 @@ const db = await SlateDB.open("/my-db", ":memory:");
 // const db = await SlateDB.open("/my-db", "s3://my-bucket");
 
 // Open with custom settings
-const db2 = await SlateDB.openWithSettings("/my-db", ":memory:", {
+const db2 = await SlateDB.open("/my-db", ":memory:", {
   flushIntervalMs: 100,
   l0SstSizeBytes: 64 * 1024 * 1024,
   mergeOperator: "uint64_add",
@@ -79,7 +79,7 @@ await batch.put(Buffer.from("k2"), Buffer.from("v2"));
 await batch.delete(Buffer.from("old"));
 await db.writeBatch(batch);
 
-// Merge — requires mergeOperator in openWithSettings
+// Merge — requires mergeOperator in settings
 await db2.merge(Buffer.from("counter"), Buffer.from([5, 0, 0, 0, 0, 0, 0, 0]));
 
 // Transaction — ACID with conflict detection
@@ -116,9 +116,9 @@ All operations are **async** and return Promises. Backpressure from cloud backen
 
 ### Opening
 
-#### `await SlateDB.open(path, url?)`
+#### `await SlateDB.open(path, url?, settings?)`
 
-Open a database with default settings. `path` is the logical key prefix inside the store. `url` selects the backend (defaults to `":memory:"`).
+Open a database. `path` is the logical key prefix inside the store. `url` selects the backend (defaults to `":memory:"`). Pass `settings` to configure flush intervals, SST sizes, TTL, merge operators, etc.
 
 | URL scheme       | Backend                   | Required env vars                                                              |
 | ---------------- | ------------------------- | ------------------------------------------------------------------------------ |
@@ -157,9 +157,7 @@ export AWS_S3_EXPRESS=true
 bun run bencher -- db --url "s3://my-bucket--use1-az4--x-s3" --duration 30
 ```
 
-#### `await SlateDB.openWithSettings(path, url, settings)`
-
-Open with custom configuration:
+**Settings:**
 
 ```typescript
 type Settings = {
@@ -209,7 +207,7 @@ Delete a key. `awaitDurable` defaults to `true`.
 
 #### `await db.merge(key, value, awaitDurable?, ttl?)`
 
-Merge a value using the configured merge operator. Requires `mergeOperator` to be set via `openWithSettings`. The merge operator combines the existing value with the new value at read time.
+Merge a value using the configured merge operator. Requires `mergeOperator` to be set via `settings` in `open()`. The merge operator combines the existing value with the new value at read time.
 
 Built-in operators:
 - **`"string_concat"`** — appends bytes (useful for strings)
@@ -358,7 +356,7 @@ Integration tests are organized in 13 groups — 49 tests total:
 | **flush options**       |     2 | FlushType.Wal and FlushType.MemTable                           |
 | **metrics**             |     1 | Runtime stats shape validation                                 |
 | **checkpoint**          |     2 | Create with defaults, create with name and lifetime            |
-| **openWithSettings**    |     2 | Custom settings, unknown merge operator error                  |
+| **open with settings**  |     2 | Custom settings, unknown merge operator error                  |
 | **getString**           |     3 | DB getString, missing key, transaction getString               |
 
 ```bash
@@ -432,7 +430,7 @@ bun run bencher -- transaction --url "az://my-container"
 bun run bencher -- db --await-durable --flush-interval 10
 ```
 
-The `--flush-interval` flag sets the WAL flush interval in milliseconds via `openWithSettings`. With `--await-durable`, every write blocks until the next flush completes — so the flush interval directly controls durable write throughput. The default (~100ms) caps throughput at ~10 flush cycles/sec regardless of backend speed. Lowering it (e.g. `--flush-interval 10`) lets faster backends like S3 Express One Zone show their latency advantage over standard S3.
+The `--flush-interval` flag sets the WAL flush interval in milliseconds. With `--await-durable`, every write blocks until the next flush completes — so the flush interval directly controls durable write throughput. The default (~100ms) caps throughput at ~10 flush cycles/sec regardless of backend speed. Lowering it (e.g. `--flush-interval 10`) lets faster backends like S3 Express One Zone show their latency advantage over standard S3.
 
 Shorthand scripts:
 
@@ -468,7 +466,7 @@ The Rust layer (`src/lib.rs`) exposes native JS classes via napi-rs `#[napi]` ma
 
 | Class             | Methods                                                                         | Purpose                    |
 | ----------------- | ------------------------------------------------------------------------------- | -------------------------- |
-| **SlateDB**       | `open`, `openWithSettings`, `close`, `put`, `get`, `getString`, `delete`, `merge`, `flush`, `scan`, `scanPrefix`, `writeBatch`, `begin`, `snapshot`, `createCheckpoint`, `metrics` | Database lifecycle + all ops |
+| **SlateDB**       | `open`, `close`, `put`, `get`, `getString`, `delete`, `merge`, `flush`, `scan`, `scanPrefix`, `writeBatch`, `begin`, `snapshot`, `createCheckpoint`, `metrics` | Database lifecycle + all ops |
 | **WriteBatch**    | `new`, `put`, `merge`, `delete`, `free`                                         | Atomic batch writes        |
 | **Transaction**   | `put`, `get`, `getString`, `delete`, `merge`, `scan`, `scanPrefix`, `commit`, `rollback` | ACID transactions          |
 | **Snapshot**      | `get`, `getString`, `scan`, `scanPrefix`                                        | Read-only point-in-time    |

@@ -258,73 +258,71 @@ pub struct SlateDB {
 
 #[napi]
 impl SlateDB {
-    /// Open a SlateDB instance with default settings.
+    /// Open a SlateDB instance. Pass optional settings to configure flush
+    /// interval, SST sizes, TTL, merge operators, etc.
     /// Times out after 30 seconds on misconfigured backends.
     #[napi(factory)]
-    pub async fn open(path: String, url: Option<String>) -> Result<SlateDB> {
-        let url = url.unwrap_or_else(|| ":memory:".to_string());
-        let store = resolve_store(&url)?;
-        let db = tokio::time::timeout(Duration::from_secs(30), Db::open(path.as_str(), store))
-            .await
-            .map_err(|_| {
-                Error::from_reason(
-                    "SlateDB.open timed out after 30s — check credentials, region, and bucket access",
-                )
-            })?
-            .map_err(to_napi_err)?;
-        Ok(SlateDB { db })
-    }
-
-    /// Open a SlateDB instance with custom settings.
-    #[napi(factory, js_name = "openWithSettings")]
-    pub async fn open_with_settings(
+    pub async fn open(
         path: String,
         url: Option<String>,
-        settings: JsSettings,
+        settings: Option<JsSettings>,
     ) -> Result<SlateDB> {
         let url = url.unwrap_or_else(|| ":memory:".to_string());
         let store = resolve_store(&url)?;
 
-        let mut cfg = Settings::default();
-        if let Some(ms) = settings.flush_interval_ms {
-            cfg.flush_interval = Some(Duration::from_millis(ms as u64));
-        }
-        if let Some(n) = settings.l0_sst_size_bytes {
-            cfg.l0_sst_size_bytes = n as usize;
-        }
-        if let Some(n) = settings.l0_max_ssts {
-            cfg.l0_max_ssts = n as usize;
-        }
-        if let Some(n) = settings.max_unflushed_bytes {
-            cfg.max_unflushed_bytes = n as usize;
-        }
-        if let Some(ttl) = settings.default_ttl_ms {
-            cfg.default_ttl = Some(ttl as u64);
-        }
-
-        let merge_op: Option<Arc<dyn MergeOperator + Send + Sync>> =
-            match settings.merge_operator.as_deref() {
-                Some("string_concat") => Some(Arc::new(StringConcatMergeOperator)),
-                Some("uint64_add") => Some(Arc::new(Uint64AddMergeOperator)),
-                Some(other) => {
-                    return Err(Error::from_reason(format!(
-                        "unknown merge operator: '{other}'. Use 'string_concat' or 'uint64_add'"
-                    )))
+        let db = match settings {
+            Some(settings) => {
+                let mut cfg = Settings::default();
+                if let Some(ms) = settings.flush_interval_ms {
+                    cfg.flush_interval = Some(Duration::from_millis(ms as u64));
                 }
-                None => None,
-            };
-        cfg.merge_operator = merge_op;
+                if let Some(n) = settings.l0_sst_size_bytes {
+                    cfg.l0_sst_size_bytes = n as usize;
+                }
+                if let Some(n) = settings.l0_max_ssts {
+                    cfg.l0_max_ssts = n as usize;
+                }
+                if let Some(n) = settings.max_unflushed_bytes {
+                    cfg.max_unflushed_bytes = n as usize;
+                }
+                if let Some(ttl) = settings.default_ttl_ms {
+                    cfg.default_ttl = Some(ttl as u64);
+                }
 
-        let builder = Db::builder(path.as_str(), store).with_settings(cfg);
+                let merge_op: Option<Arc<dyn MergeOperator + Send + Sync>> =
+                    match settings.merge_operator.as_deref() {
+                        Some("string_concat") => Some(Arc::new(StringConcatMergeOperator)),
+                        Some("uint64_add") => Some(Arc::new(Uint64AddMergeOperator)),
+                        Some(other) => {
+                            return Err(Error::from_reason(format!(
+                                "unknown merge operator: '{other}'. Use 'string_concat' or 'uint64_add'"
+                            )))
+                        }
+                        None => None,
+                    };
+                cfg.merge_operator = merge_op;
 
-        let db = tokio::time::timeout(Duration::from_secs(30), builder.build())
-            .await
-            .map_err(|_| {
-                Error::from_reason(
-                    "SlateDB.open timed out after 30s — check credentials, region, and bucket access",
-                )
-            })?
-            .map_err(to_napi_err)?;
+                let builder = Db::builder(path.as_str(), store).with_settings(cfg);
+                tokio::time::timeout(Duration::from_secs(30), builder.build())
+                    .await
+                    .map_err(|_| {
+                        Error::from_reason(
+                            "SlateDB.open timed out after 30s — check credentials, region, and bucket access",
+                        )
+                    })?
+                    .map_err(to_napi_err)?
+            }
+            None => {
+                tokio::time::timeout(Duration::from_secs(30), Db::open(path.as_str(), store))
+                    .await
+                    .map_err(|_| {
+                        Error::from_reason(
+                            "SlateDB.open timed out after 30s — check credentials, region, and bucket access",
+                        )
+                    })?
+                    .map_err(to_napi_err)?
+            }
+        };
         Ok(SlateDB { db })
     }
 
@@ -365,7 +363,7 @@ impl SlateDB {
     // -----------------------------------------------------------------------
 
     /// Merge a value into the database using the configured merge operator.
-    /// Requires a merge operator to be set via openWithSettings.
+    /// Requires a merge operator to be set via settings in open().
     #[napi]
     pub async unsafe fn merge(
         &mut self,
