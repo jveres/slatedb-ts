@@ -131,7 +131,7 @@ Open a database. `path` is the logical key prefix inside the store. `url` select
 | `az://container` | Azure Blob Storage        | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY`                      |
 | `gs://bucket`    | Google Cloud Storage      | `GOOGLE_SERVICE_ACCOUNT`                                                       |
 
-For S3-compatible backends (AWS, R2, MinIO), credentials are loaded via [`AmazonS3Builder::from_env()`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env) with `S3ConditionalPut::ETagMatch` (required for SlateDB's manifest fencing). `open()` has a 30-second timeout to prevent hanging on misconfigured backends.
+For S3-compatible backends (AWS, R2, MinIO), credentials are loaded via [`AmazonS3Builder::from_env()`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env) with `S3ConditionalPut::ETagMatch` (required for SlateDB's manifest fencing). Cloud backends are probed on `open()` with a fast credential check — bad credentials fail in ~500ms with a clear error instead of hanging.
 
 **S3 Express One Zone** (directory buckets) are supported via `AWS_S3_EXPRESS=true`. The bucket name must follow the directory bucket naming convention (`bucket--azid--x-s3`). The `object_store` crate automatically constructs the zonal endpoint and uses `CreateSession` for short-lived session tokens. S3 Express supports `If-Match` conditional puts required for SlateDB's manifest fencing.
 
