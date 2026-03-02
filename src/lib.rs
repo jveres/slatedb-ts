@@ -52,13 +52,15 @@ fn cstr_to_str<'a>(s: *const c_char) -> &'a str {
 /// Supported schemes:
 ///   `:memory:`       — in-memory (default)
 ///   `file:///path`   — local filesystem
-///   `s3://bucket`    — AWS S3 (reads AWS_* env vars via AmazonS3Builder::from_env)
+///   `s3://bucket`    — AWS S3, Cloudflare R2, MinIO (reads AWS_* env vars)
 ///   `az://container` — Azure Blob (reads AZURE_* env vars)
 ///
-/// For S3 we use `AmazonS3Builder::from_env()` with `S3ConditionalPut::ETagMatch`,
-/// matching SlateDB's own bencher (`admin::load_aws`). The generic
-/// `Db::resolve_object_store` lowercases env vars for `parse_url_opts` which can
-/// misconfigure the client.
+/// For S3-compatible backends we use `AmazonS3Builder::from_env()` with
+/// `S3ConditionalPut::ETagMatch`, matching SlateDB's own bencher
+/// (`admin::load_aws`). This reads AWS_ENDPOINT for R2/MinIO, AWS_REGION,
+/// AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY correctly from env vars.
+/// The generic `Db::resolve_object_store` lowercases env vars for
+/// `parse_url_opts` which can misconfigure the client.
 fn resolve_store(url: *const c_char) -> Arc<dyn ObjectStore> {
     let u = cstr_to_str(url);
     if u.is_empty() || u == ":memory:" {

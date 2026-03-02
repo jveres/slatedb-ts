@@ -73,24 +73,38 @@ db.close();
 
 Open a database. `path` is the logical key prefix inside the store. `url` selects the backend (defaults to `":memory:"`).
 
-| URL scheme       | Backend              | Required env vars                                          |
-| ---------------- | -------------------- | ---------------------------------------------------------- |
-| `:memory:`       | In-memory            | —                                                          |
-| `file:///path`   | Local filesystem     | —                                                          |
-| `s3://bucket`    | AWS S3               | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` |
-| `az://container` | Azure Blob Storage   | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY`  |
-| `gs://bucket`    | Google Cloud Storage | `GOOGLE_SERVICE_ACCOUNT`                                   |
+| URL scheme       | Backend              | Required env vars                                                              |
+| ---------------- | -------------------- | ------------------------------------------------------------------------------ |
+| `:memory:`       | In-memory            | —                                                                              |
+| `file:///path`   | Local filesystem     | —                                                                              |
+| `s3://bucket`    | AWS S3               | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`                     |
+| `s3://bucket`    | Cloudflare R2        | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT`, `AWS_REGION=auto` |
+| `s3://bucket`    | MinIO                | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT`, `AWS_ALLOW_HTTP` |
+| `az://container` | Azure Blob Storage   | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY`                      |
+| `gs://bucket`    | Google Cloud Storage | `GOOGLE_SERVICE_ACCOUNT`                                                       |
 
-For S3, credentials are loaded via [`AmazonS3Builder::from_env()`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env) with `S3ConditionalPut::ETagMatch` (required for SlateDB's manifest fencing). For other backends, URL resolution is handled by the Rust [`object_store`](https://docs.rs/object_store) crate. `Db::open()` has a 30-second timeout to prevent hanging on misconfigured backends.
+For S3-compatible backends (AWS, R2, MinIO), credentials are loaded via [`AmazonS3Builder::from_env()`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env) with `S3ConditionalPut::ETagMatch` (required for SlateDB's manifest fencing). R2 and MinIO support ETag-based conditional puts. For other backends, URL resolution is handled by the Rust [`object_store`](https://docs.rs/object_store) crate. `Db::open()` has a 30-second timeout to prevent hanging on misconfigured backends.
+
+**Cloudflare R2 example:**
+
+```bash
+export AWS_ACCESS_KEY_ID="<r2-access-key-id>"
+export AWS_SECRET_ACCESS_KEY="<r2-secret-access-key>"
+export AWS_ENDPOINT="https://<account-id>.r2.cloudflarestorage.com"
+export AWS_REGION="auto"
+
+SLATEDB_TEST_URLS="s3://my-r2-bucket" bun test
+```
 
 > **Coming from the Rust `slatedb-bencher`?** The Rust CLI uses the older `admin::load_object_store_from_env()` API which reads a `CLOUD_PROVIDER` env var. This bridge uses URL strings instead — the mapping is:
 >
-> | Rust `CLOUD_PROVIDER`                        | Bun `url`                                    |
-> | -------------------------------------------- | -------------------------------------------- |
-> | `CLOUD_PROVIDER=memory`                      | `":memory:"`                                 |
-> | `CLOUD_PROVIDER=local` + `LOCAL_PATH=/tmp/x` | `"file:///tmp/x"`                            |
-> | `CLOUD_PROVIDER=aws` + `AWS_*` env vars      | `"s3://bucket"` + same `AWS_*` env vars      |
-> | `CLOUD_PROVIDER=azure` + `AZURE_*` env vars  | `"az://container"` + same `AZURE_*` env vars |
+> | Rust `CLOUD_PROVIDER`                        | Bun `url`                                                    |
+> | -------------------------------------------- | ------------------------------------------------------------ |
+> | `CLOUD_PROVIDER=memory`                      | `":memory:"`                                                 |
+> | `CLOUD_PROVIDER=local` + `LOCAL_PATH=/tmp/x` | `"file:///tmp/x"`                                            |
+> | `CLOUD_PROVIDER=aws` + `AWS_*` env vars      | `"s3://bucket"` + same `AWS_*` env vars                      |
+> | `CLOUD_PROVIDER=azure` + `AZURE_*` env vars  | `"az://container"` + same `AZURE_*` env vars                 |
+> | _(not supported)_                             | `"s3://bucket"` + `AWS_ENDPOINT` for R2/MinIO/S3-compatible  |
 
 ### `db.put(key, value, awaitDurable?)`
 
@@ -185,6 +199,9 @@ SLATEDB_TEST_URLS="s3://my-bucket" bun test
 
 # Azure Blob Storage
 SLATEDB_TEST_URLS="az://my-container" bun test
+
+# Cloudflare R2 (set AWS_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION=auto)
+SLATEDB_TEST_URLS="s3://my-r2-bucket" bun test
 ```
 
 Every backend listed in `SLATEDB_TEST_URLS` (comma-separated) gets the full 23-test suite. Each run uses unique timestamped paths to avoid collisions on persistent stores.
