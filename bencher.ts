@@ -141,7 +141,7 @@ function makeKeyGen(type: string, keyLen: number, keyCount: number): KeyGenerato
 // ---------------------------------------------------------------------------
 function cloudWarning(url: string) {
   if (/^(s3|az|gs):\/\//.test(url)) {
-    console.log(`\n  ⚠ Cloud backend — writes may stall under backpressure`);
+    console.log(`\n  ⚠ Cloud backend — if the run stalls, reduce --val-len or --put-percentage`);
   }
 }
 
