@@ -1,5 +1,5 @@
 [package]
-name = "slatedb-ffi"
+name = "slatedb-napi"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,13 +9,13 @@ crate-type = ["cdylib"]
 [dependencies]
 slatedb = { version = "0.10.0", default-features = false, features = ["moka", "aws", "azure"] }
 object_store = "0.12.3"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+napi = { version = "3", features = ["async", "napi9"] }
+napi-derive = "3"
 bytes = "1"
-once_cell = "1"
 
-[[example]]
-name = "native_bench"
-path = "native_bench.rs"
+[build-dependencies]
+napi-build = "1"
 
 [profile.release]
 lto = true

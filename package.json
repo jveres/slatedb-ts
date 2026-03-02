@@ -1,10 +1,10 @@
 {
   "name": "slatedb",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "index.ts",
   "scripts": {
-    "build": "cargo build --release",
+    "build": "cargo build --release && cp target/release/libslatedb_napi.dylib slatedb_napi.darwin-arm64.node",
     "test": "bun test",
     "bench": "bun run bench.ts",
     "bencher": "bun run bencher.ts",

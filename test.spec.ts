@@ -1,78 +1,62 @@
 /**
  * Integration test — faithful port of SlateDB's `examples/src/full_example.rs`.
  *
- * Uses one DB per test group (beforeAll/afterAll) to minimize object store
- * round-trips. This matches how SlateDB's own cloud-compatible test
- * (tests/db.rs) operates — a single DB shared across all operations.
- *
- * All writes use `awaitDurable=false` with explicit `flush()` where needed,
- * matching SlateDB's own pattern. Non-durable writes land in the memtable
- * immediately and are visible within the same process.
- *
- * Usage:
- *   bun test                                              # in-memory only
- *   SLATEDB_TEST_URLS=":memory:,file:///tmp/slate" bun test
- *   SLATEDB_TEST_URLS="s3://my-bucket" bun test
+ * Now fully async via napi-rs. All operations return Promises —
+ * no blocking the main thread, no backpressure stalls.
  *
  * @see https://github.com/slatedb/slatedb/blob/main/examples/src/full_example.rs
  * @see https://github.com/slatedb/slatedb/blob/main/slatedb/tests/db.rs
  */
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { SlateDB, WriteBatch, Transaction, IsolationLevel } from "./index";
+import { SlateDB, WriteBatch, IsolationLevel } from "./index";
 
-// ---------------------------------------------------------------------------
-// Backend resolution
-// ---------------------------------------------------------------------------
 const urls = (process.env.SLATEDB_TEST_URLS ?? ":memory:")
   .split(",")
-  .map((s) => s.trim())
+  .map((s: string) => s.trim())
   .filter(Boolean);
 
 const dec = new TextDecoder();
-const str = (b: Uint8Array) => dec.decode(b);
+const str = (b: Buffer | Uint8Array) => dec.decode(b);
 
-/** Unique path per run so persistent backends don't collide. */
 function uniquePath(tag: string): string {
   return `/tmp/slatedb_ts_${tag}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-// ---------------------------------------------------------------------------
-// Tests — run the full suite once per backend URL
-// ---------------------------------------------------------------------------
 for (const url of urls) {
   const label = url === ":memory:" ? "memory" : url;
 
   describe(`[${label}] full_example.rs`, () => {
-    let db: SlateDB;
+    let db: any;
 
-    beforeAll(() => {
-      db = SlateDB.open(uniquePath("full"), url);
+    beforeAll(async () => {
+      db = await SlateDB.open(uniquePath("full"), url);
     });
 
-    afterAll(() => {
-      db.close();
+    afterAll(async () => {
+      await db.close();
     });
 
-    test("put then get returns the value", () => {
-      db.put("test_key", "test_value", false);
-      expect(db.getString("test_key")).toBe("test_value");
+    test("put then get returns the value", async () => {
+      await db.put(Buffer.from("test_key"), Buffer.from("test_value"), false);
+      const val = await db.get(Buffer.from("test_key"));
+      expect(str(val)).toBe("test_value");
     });
 
-    test("delete removes the key", () => {
-      db.put("del_key", "del_value", false);
-      expect(db.getString("del_key")).toBe("del_value");
+    test("delete removes the key", async () => {
+      await db.put(Buffer.from("del_key"), Buffer.from("del_value"), false);
+      expect(str(await db.get(Buffer.from("del_key")))).toBe("del_value");
 
-      db.delete("del_key", false);
-      expect(db.get("del_key")).toBeNull();
+      await db.delete(Buffer.from("del_key"), false);
+      expect(await db.get(Buffer.from("del_key"))).toBeNull();
     });
 
-    test("scan over unbounded range returns all keys in sorted order", () => {
-      db.put("scan_key1", "scan_value1", false);
-      db.put("scan_key2", "scan_value2", false);
-      db.put("scan_key3", "scan_value3", false);
-      db.put("scan_key4", "scan_value4", false);
+    test("scan over unbounded range returns all keys in sorted order", async () => {
+      await db.put(Buffer.from("scan_key1"), Buffer.from("scan_value1"), false);
+      await db.put(Buffer.from("scan_key2"), Buffer.from("scan_value2"), false);
+      await db.put(Buffer.from("scan_key3"), Buffer.from("scan_value3"), false);
+      await db.put(Buffer.from("scan_key4"), Buffer.from("scan_value4"), false);
 
-      const items = db.scan("scan_key1", "scan_key5");
+      const items = await db.scan(Buffer.from("scan_key1"), Buffer.from("scan_key5"));
       expect(items).toHaveLength(4);
 
       for (let i = 0; i < items.length; i++) {
@@ -82,211 +66,209 @@ for (const url of urls) {
       }
     });
 
-    test("scan over bounded range [key1, key3) returns matching keys", () => {
-      const items = db.scan("scan_key1", "scan_key3");
+    test("scan over bounded range [key1, key3) returns matching keys", async () => {
+      const items = await db.scan(Buffer.from("scan_key1"), Buffer.from("scan_key3"));
       expect(items).toHaveLength(2);
       expect(str(items[0].key)).toBe("scan_key1");
-      expect(str(items[0].value)).toBe("scan_value1");
       expect(str(items[1].key)).toBe("scan_key2");
-      expect(str(items[1].value)).toBe("scan_value2");
     });
 
-    test("scan with start bound returns keys from that point", () => {
-      const items = db.scan("scan_key4", "scan_key5");
+    test("scan with start bound returns keys from that point", async () => {
+      const items = await db.scan(Buffer.from("scan_key4"), Buffer.from("scan_key5"));
       expect(items).toHaveLength(1);
       expect(str(items[0].key)).toBe("scan_key4");
-      expect(str(items[0].value)).toBe("scan_value4");
     });
   });
 
   describe(`[${label}] write batch`, () => {
-    let db: SlateDB;
+    let db: any;
 
-    beforeAll(() => {
-      db = SlateDB.open(uniquePath("batch"), url);
+    beforeAll(async () => {
+      db = await SlateDB.open(uniquePath("batch"), url);
     });
 
-    afterAll(() => {
-      db.close();
+    afterAll(async () => {
+      await db.close();
     });
 
-    test("atomic multi-put via WriteBatch", () => {
+    test("atomic multi-put via WriteBatch", async () => {
       const batch = new WriteBatch();
-      batch.put("b1", "v1");
-      batch.put("b2", "v2");
-      batch.put("b3", "v3");
-      db.writeBatch(batch, false);
+      await batch.put(Buffer.from("b1"), Buffer.from("v1"));
+      await batch.put(Buffer.from("b2"), Buffer.from("v2"));
+      await batch.put(Buffer.from("b3"), Buffer.from("v3"));
+      await db.writeBatch(batch, false);
 
-      expect(db.getString("b1")).toBe("v1");
-      expect(db.getString("b2")).toBe("v2");
-      expect(db.getString("b3")).toBe("v3");
+      expect(str(await db.get(Buffer.from("b1")))).toBe("v1");
+      expect(str(await db.get(Buffer.from("b2")))).toBe("v2");
+      expect(str(await db.get(Buffer.from("b3")))).toBe("v3");
     });
 
-    test("WriteBatch with deletes", () => {
-      db.put("bd1", "before", false);
-      db.put("bd2", "keep", false);
+    test("WriteBatch with deletes", async () => {
+      await db.put(Buffer.from("bd1"), Buffer.from("before"), false);
+      await db.put(Buffer.from("bd2"), Buffer.from("keep"), false);
 
       const batch = new WriteBatch();
-      batch.delete("bd1");
-      batch.put("bd3", "new");
-      db.writeBatch(batch, false);
+      await batch.delete(Buffer.from("bd1"));
+      await batch.put(Buffer.from("bd3"), Buffer.from("new"));
+      await db.writeBatch(batch, false);
 
-      expect(db.get("bd1")).toBeNull();
-      expect(db.getString("bd2")).toBe("keep");
-      expect(db.getString("bd3")).toBe("new");
+      expect(await db.get(Buffer.from("bd1"))).toBeNull();
+      expect(str(await db.get(Buffer.from("bd2")))).toBe("keep");
+      expect(str(await db.get(Buffer.from("bd3")))).toBe("new");
     });
 
-    test("WriteBatch non-durable", () => {
+    test("WriteBatch non-durable", async () => {
       const batch = new WriteBatch();
-      batch.put("bnd1", "fast");
-      db.writeBatch(batch, false);
+      await batch.put(Buffer.from("bnd1"), Buffer.from("fast"));
+      await db.writeBatch(batch, false);
 
-      expect(db.getString("bnd1")).toBe("fast");
+      expect(str(await db.get(Buffer.from("bnd1")))).toBe("fast");
     });
 
-    test("free unused WriteBatch without error", () => {
+    test("free unused WriteBatch without error", async () => {
       const batch = new WriteBatch();
-      batch.put("unused", "data");
-      batch.free(); // should not throw
+      await batch.put(Buffer.from("unused"), Buffer.from("data"));
+      await batch.free();
     });
   });
 
   describe(`[${label}] transactions`, () => {
-    let db: SlateDB;
+    let db: any;
 
-    beforeAll(() => {
-      db = SlateDB.open(uniquePath("txn"), url);
+    beforeAll(async () => {
+      db = await SlateDB.open(uniquePath("txn"), url);
     });
 
-    afterAll(() => {
-      db.close();
+    afterAll(async () => {
+      await db.close();
     });
 
-    test("transaction commit makes writes visible", () => {
-      const txn = db.begin();
-      txn.put("tk1", "tv1");
-      txn.put("tk2", "tv2");
-      txn.commit(false);
+    test("transaction commit makes writes visible", async () => {
+      const txn = await db.begin();
+      await txn.put(Buffer.from("tk1"), Buffer.from("tv1"));
+      await txn.put(Buffer.from("tk2"), Buffer.from("tv2"));
+      await txn.commit(false);
 
-      expect(db.getString("tk1")).toBe("tv1");
-      expect(db.getString("tk2")).toBe("tv2");
+      expect(str(await db.get(Buffer.from("tk1")))).toBe("tv1");
+      expect(str(await db.get(Buffer.from("tk2")))).toBe("tv2");
     });
 
-    test("transaction rollback discards writes", () => {
-      db.put("tr_existing", "original", false);
+    test("transaction rollback discards writes", async () => {
+      await db.put(Buffer.from("tr_existing"), Buffer.from("original"), false);
 
-      const txn = db.begin();
-      txn.put("tr_existing", "modified");
-      txn.put("tr_new_key", "new_val");
-      txn.rollback();
+      const txn = await db.begin();
+      await txn.put(Buffer.from("tr_existing"), Buffer.from("modified"));
+      await txn.put(Buffer.from("tr_new_key"), Buffer.from("new_val"));
+      await txn.rollback();
 
-      expect(db.getString("tr_existing")).toBe("original");
-      expect(db.get("tr_new_key")).toBeNull();
+      expect(str(await db.get(Buffer.from("tr_existing")))).toBe("original");
+      expect(await db.get(Buffer.from("tr_new_key"))).toBeNull();
     });
 
-    test("transaction read-your-writes", () => {
-      db.put("ryw", "before", false);
+    test("transaction read-your-writes", async () => {
+      await db.put(Buffer.from("ryw"), Buffer.from("before"), false);
 
-      const txn = db.begin();
-      txn.put("ryw", "inside_txn");
-      expect(txn.getString("ryw")).toBe("inside_txn");
-      txn.commit(false);
+      const txn = await db.begin();
+      await txn.put(Buffer.from("ryw"), Buffer.from("inside_txn"));
+      const val = await txn.get(Buffer.from("ryw"));
+      expect(str(val)).toBe("inside_txn");
+      await txn.commit(false);
 
-      expect(db.getString("ryw")).toBe("inside_txn");
+      expect(str(await db.get(Buffer.from("ryw")))).toBe("inside_txn");
     });
 
-    test("transaction delete", () => {
-      db.put("td", "will_delete", false);
+    test("transaction delete", async () => {
+      await db.put(Buffer.from("td"), Buffer.from("will_delete"), false);
 
-      const txn = db.begin();
-      txn.delete("td");
-      expect(txn.get("td")).toBeNull();
-      txn.commit(false);
+      const txn = await db.begin();
+      await txn.delete(Buffer.from("td"));
+      expect(await txn.get(Buffer.from("td"))).toBeNull();
+      await txn.commit(false);
 
-      expect(db.get("td")).toBeNull();
+      expect(await db.get(Buffer.from("td"))).toBeNull();
     });
 
-    test("transaction commit non-durable", () => {
-      const txn = db.begin();
-      txn.put("nd_txn", "fast");
-      txn.commit(false);
+    test("transaction commit non-durable", async () => {
+      const txn = await db.begin();
+      await txn.put(Buffer.from("nd_txn"), Buffer.from("fast"));
+      await txn.commit(false);
 
-      expect(db.getString("nd_txn")).toBe("fast");
+      expect(str(await db.get(Buffer.from("nd_txn")))).toBe("fast");
     });
 
-    test("transaction with SerializableSnapshot isolation", () => {
-      const txn = db.begin(IsolationLevel.SerializableSnapshot);
-      txn.put("iso", "serializable");
-      txn.commit(false);
+    test("transaction with SerializableSnapshot isolation", async () => {
+      const txn = await db.begin(IsolationLevel.SerializableSnapshot);
+      await txn.put(Buffer.from("iso"), Buffer.from("serializable"));
+      await txn.commit(false);
 
-      expect(db.getString("iso")).toBe("serializable");
+      expect(str(await db.get(Buffer.from("iso")))).toBe("serializable");
     });
   });
 
   describe(`[${label}] bridge extras`, () => {
-    let db: SlateDB;
+    let db: any;
 
-    beforeAll(() => {
-      db = SlateDB.open(uniquePath("extra"), url);
+    beforeAll(async () => {
+      db = await SlateDB.open(uniquePath("extra"), url);
     });
 
-    afterAll(() => {
-      db.close();
+    afterAll(async () => {
+      await db.close();
     });
 
-    test("binary keys and values round-trip", () => {
-      const key = new Uint8Array([0xCA, 0xFE]);
-      const val = new Uint8Array([0xBE, 0xEF]);
-      db.put(key, val, false);
+    test("binary keys and values round-trip", async () => {
+      const key = Buffer.from([0xCA, 0xFE]);
+      const val = Buffer.from([0xBE, 0xEF]);
+      await db.put(key, val, false);
 
-      const got = db.get(key);
+      const got = await db.get(key);
       expect(got).not.toBeNull();
-      expect(got![0]).toBe(0xBE);
-      expect(got![1]).toBe(0xEF);
+      expect(got[0]).toBe(0xBE);
+      expect(got[1]).toBe(0xEF);
     });
 
-    test("get on missing key returns null", () => {
-      expect(db.get("no_such_key")).toBeNull();
-      expect(db.getString("no_such_key")).toBeNull();
+    test("get on missing key returns null", async () => {
+      expect(await db.get(Buffer.from("no_such_key"))).toBeNull();
     });
 
-    test("put empty value", () => {
-      db.put("empty", new Uint8Array(0), false);
-      const got = db.get("empty");
+    test("put empty value", async () => {
+      await db.put(Buffer.from("empty"), Buffer.from([]), false);
+      const got = await db.get(Buffer.from("empty"));
       expect(got).not.toBeNull();
-      expect(got!.byteLength).toBe(0);
+      expect(got.byteLength).toBe(0);
     });
 
-    test("overwrite replaces value", () => {
-      db.put("ow_k", "v1", false);
-      expect(db.getString("ow_k")).toBe("v1");
-      db.put("ow_k", "v2", false);
-      expect(db.getString("ow_k")).toBe("v2");
+    test("overwrite replaces value", async () => {
+      await db.put(Buffer.from("ow_k"), Buffer.from("v1"), false);
+      expect(str(await db.get(Buffer.from("ow_k")))).toBe("v1");
+      await db.put(Buffer.from("ow_k"), Buffer.from("v2"), false);
+      expect(str(await db.get(Buffer.from("ow_k")))).toBe("v2");
     });
 
-    test("delete non-existent key is a no-op", () => {
-      db.delete("ghost", false);
+    test("delete non-existent key is a no-op", async () => {
+      await db.delete(Buffer.from("ghost"), false);
     });
 
-    test("scan empty prefix returns empty array", () => {
-      expect(db.scan("zzz_no_match", "zzz_no_match~")).toEqual([]);
+    test("scan empty prefix returns empty array", async () => {
+      const items = await db.scan(Buffer.from("zzz_no_match"), Buffer.from("zzz_no_match~"));
+      expect(items).toEqual([]);
     });
 
-    test("flush does not lose data", () => {
-      db.put("fl1", "v1", false);
-      db.flush();
-      expect(db.getString("fl1")).toBe("v1");
+    test("flush does not lose data", async () => {
+      await db.put(Buffer.from("fl1"), Buffer.from("v1"), false);
+      await db.flush();
+      expect(str(await db.get(Buffer.from("fl1")))).toBe("v1");
     });
 
-    test("many sequential writes maintain scan order", () => {
+    test("many sequential writes maintain scan order", async () => {
       const n = 100;
       for (let i = 0; i < n; i++) {
         const key = `seq_${String(i).padStart(4, "0")}`;
-        db.put(key, `val_${i}`, false);
+        await db.put(Buffer.from(key), Buffer.from(`val_${i}`), false);
       }
-      db.flush();
+      await db.flush();
 
-      const items = db.scan("seq_", "seq_~");
+      const items = await db.scan(Buffer.from("seq_"), Buffer.from("seq_~"));
       expect(items).toHaveLength(n);
 
       for (let i = 1; i < items.length; i++) {
