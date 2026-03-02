@@ -232,16 +232,16 @@ bun run bench
 
 Apple Silicon, in-memory backend, same machine:
 
-| Benchmark                         | SlateDB Criterion | napi-rs (p50) | Overhead |
-| --------------------------------- | ----------------- | ------------- | -------- |
-| **put** (non-durable)             | 9.28 μs           | 13.42 μs      | **+45%** |
-| **open_close**                    | 172.35 μs         | 111.33 μs     | — ¹      |
-| **get** (hot key)                 | —                 | 15.33 μs      | —        |
-| **scan** (100 keys, ~100B values) | —                 | 119.50 μs     | —        |
+| Benchmark                         | SlateDB Criterion | napi-rs (p50) | Overhead  |
+| --------------------------------- | ----------------: | ------------: | --------: |
+| **put** (non-durable)             | 9.42 μs           | 13.42 μs      | **+42%**  |
+| **get** (hot key)                 | 1.16 μs           | 15.33 μs      | **+13×**  |
+| **scan** (100 keys, ~100B values) | 53.37 μs          | 119.50 μs     | **+2.2×** |
+| **open_close**                    | 172.41 μs         | 111.33 μs     | −35% ¹    |
 
-¹ `open_close` is faster in napi-rs because Criterion uses `b.to_async(&runtime)` which has per-iteration scheduling overhead; the napi-rs Tokio runtime runs the future directly.
+¹ `open_close` appears faster in napi-rs because Criterion uses `b.to_async(&runtime)` which adds per-iteration scheduling overhead; the napi-rs Tokio runtime runs the future directly.
 
-The +45% put overhead is the cost of the napi-rs JS↔Rust bridge (Promise creation, Buffer marshalling). Get and scan are not in SlateDB's Criterion suite.
+The **put** overhead (+42%) is the napi-rs bridge cost: Promise creation, N-API call dispatch, and Buffer marshalling. **get** shows the largest relative overhead (13×) because the native operation is extremely fast (~1μs memtable lookup) and each call must still pay the fixed ~14μs async bridge round-trip. **scan** at 2.2× reflects iterator materialization across the bridge — collecting all key-value pairs into a JS array of objects.
 
 ### Sustained throughput (slatedb-bencher)
 
