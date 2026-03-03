@@ -50,7 +50,8 @@ const db2 = await SlateDB.open("/my-db", ":memory:", {
 });
 
 // Read-only reader (multiple readers allowed, no fencing)
-const reader = await DbReader.open("/my-db", "s3://my-bucket");
+// Third arg = manifest poll interval in ms (default: 10000)
+const reader = await DbReader.open("/my-db", "s3://my-bucket", 1000);
 const val2 = await reader.getString(Buffer.from("hello"));
 const items2 = await reader.scanPrefix(Buffer.from("user:"));
 await reader.close();
@@ -194,7 +195,14 @@ type Settings = {
 
 #### `await DbReader.open(path, url?, manifestPollIntervalMs?)`
 
-Open a read-only reader. Multiple readers can access the same DB path concurrently alongside a single writer. The reader does not fence the writer. Reads reflect the persistent state as of when the reader was opened.
+Open a read-only reader. Multiple readers can access the same DB path concurrently alongside a single writer. The reader does not fence the writer.
+
+The reader automatically picks up new writes via manifest polling and WAL replay. The default poll interval is **10 seconds** — pass `manifestPollIntervalMs` for faster refresh (e.g. `1000` for 1s). Writes are visible to the reader after the next poll fires.
+
+```typescript
+// Fast-polling reader (1s)
+const reader = await DbReader.open("/my-db", "s3://my-bucket", 1000);
+```
 
 | Method | Description |
 | --- | --- |
@@ -204,7 +212,7 @@ Open a read-only reader. Multiple readers can access the same DB path concurrent
 | `await reader.scanPrefix(prefix, durabilityLevel?, readAheadBytes?, maxFetchTasks?)` | Prefix scan |
 | `await reader.close()` | Close the reader |
 
-> **Note:** There is a [known upstream bug](https://github.com/slatedb/slatedb/issues/1331) in SlateDB where the internal manifest poller does not refresh the reader's state. The reader currently sees a snapshot as of when it was opened. To pick up new writes, close and re-open the reader.
+> **Implementation note:** `DbReader.get()` and `getString()` use a scan-based lookup internally to work around an [upstream slatedb bug](https://github.com/slatedb/slatedb) where the point-lookup `GetIterator` returns stale values from older WAL memtables. The `DbReader` replays WAL memtables in oldest-first order (`push_back`), but `GetIterator` returns the first match — yielding the stale value. `scan` is unaffected because it uses a `MergeIterator` that resolves by sequence number. This workaround is transparent and will be removed once the upstream fix is released.
 
 ---
 

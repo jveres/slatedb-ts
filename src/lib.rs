@@ -363,6 +363,7 @@ impl SlateDB {
                 wo(await_durable),
             )
             .await
+            .map(|_| ())
             .map_err(to_napi_err)
     }
 
@@ -376,6 +377,7 @@ impl SlateDB {
         self.inner
             .delete_with_options(&key[..], wo(await_durable))
             .await
+            .map(|_| ())
             .map_err(to_napi_err)
     }
 
@@ -407,6 +409,7 @@ impl SlateDB {
         self.inner
             .merge_with_options(&key[..], &value[..], &merge_opts, wo(await_durable))
             .await
+            .map(|_| ())
             .map_err(to_napi_err)
     }
 
@@ -535,6 +538,7 @@ impl SlateDB {
         self.inner
             .write_with_options(wb, wo(await_durable))
             .await
+            .map(|_| ())
             .map_err(to_napi_err)
     }
 
@@ -645,12 +649,9 @@ pub struct JsDbReader {
 #[napi]
 impl JsDbReader {
     /// Open a read-only reader. Multiple readers can access the same DB path
-    /// concurrently alongside a single writer. The reader sees a point-in-time
-    /// snapshot as of when it was opened.
-    ///
-    /// **Note:** Upstream SlateDB has a known bug where the internal manifest
-    /// poller does not refresh the reader's state. To pick up new writes,
-    /// close and re-open the reader.
+    /// concurrently alongside a single writer. The reader automatically picks up
+    /// new writes via manifest polling (default: every 10s). Configure the poll
+    /// interval with `manifest_poll_interval_ms`.
     #[napi(factory)]
     pub async fn open(
         path: String,
@@ -681,38 +682,36 @@ impl JsDbReader {
     }
 
     /// Get raw bytes by key. Returns null if not found.
+    ///
+    /// Uses a scan-based lookup to work around an upstream slatedb bug where
+    /// the point-lookup GetIterator returns stale values from older WAL
+    /// memtables instead of the newest value.
     #[napi]
     pub async fn get(
         &self,
         key: Buffer,
         read_level: Option<JsDurabilityLevel>,
     ) -> Result<Option<Buffer>> {
-        let opts = build_read_options(read_level);
-        match self
-            .inner
-            .get_with_options(&key[..], &opts)
-            .await
-            .map_err(to_napi_err)?
-        {
+        let key_bytes = Bytes::copy_from_slice(&key[..]);
+        match self.scan_get(&key_bytes, read_level).await? {
             Some(val) => Ok(Some(Buffer::from(val.to_vec()))),
             None => Ok(None),
         }
     }
 
     /// Get value as UTF-8 string. Returns null if not found.
+    ///
+    /// Uses a scan-based lookup to work around an upstream slatedb bug where
+    /// the point-lookup GetIterator returns stale values from older WAL
+    /// memtables instead of the newest value.
     #[napi(js_name = "getString")]
     pub async fn get_string(
         &self,
         key: Buffer,
         read_level: Option<JsDurabilityLevel>,
     ) -> Result<Option<String>> {
-        let opts = build_read_options(read_level);
-        match self
-            .inner
-            .get_with_options(&key[..], &opts)
-            .await
-            .map_err(to_napi_err)?
-        {
+        let key_bytes = Bytes::copy_from_slice(&key[..]);
+        match self.scan_get(&key_bytes, read_level).await? {
             Some(val) => {
                 let s = String::from_utf8(val.to_vec())
                     .map_err(|e| Error::from_reason(format!("invalid UTF-8: {e}")))?;
@@ -758,6 +757,37 @@ impl JsDbReader {
             .await
             .map_err(to_napi_err)?;
         collect_iter(iter).await
+    }
+
+    /// Internal: scan-based single-key lookup.
+    ///
+    /// Workaround for upstream slatedb bug: DbReader replays WAL memtables
+    /// in oldest-first order (push_back), but the GetIterator used by
+    /// get_with_options returns the first match (oldest value). Scan uses
+    /// a MergeIterator that properly resolves by sequence number.
+    ///
+    /// We use range [key, key\x00) which is NOT detected as a point range,
+    /// forcing the ScanIterator path.
+    async fn scan_get(
+        &self,
+        key: &Bytes,
+        read_level: Option<JsDurabilityLevel>,
+    ) -> Result<Option<Bytes>> {
+        let mut upper = key.to_vec();
+        upper.push(0x00);
+        let upper = Bytes::from(upper);
+
+        let opts = build_scan_options(read_level, None, None);
+        let mut iter = self
+            .inner
+            .scan_with_options(key.clone()..upper, &opts)
+            .await
+            .map_err(to_napi_err)?;
+
+        match iter.next().await.map_err(to_napi_err)? {
+            Some(kv) if kv.key == *key => Ok(Some(kv.value)),
+            _ => Ok(None),
+        }
     }
 
     /// Close the reader and free native resources.
