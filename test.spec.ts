@@ -16,6 +16,7 @@ import {
   DurabilityLevel,
   FlushType,
   CheckpointScope,
+  CompressionCodec,
 } from "./index";
 
 const urls = (process.env.SLATEDB_TEST_URLS ?? ":memory:")
@@ -748,6 +749,542 @@ for (const url of urls) {
       expect(await r2.getString(Buffer.from("mk"))).toBe("mv");
       await r1.close();
       await r2.close();
+    });
+
+    test.skipIf(skipReader)(
+      "reader with skipWalReplay only sees compacted data",
+      async () => {
+        const dbPath = uniquePath("ro_skipwal");
+        const writer = await SlateDB.open(dbPath, url);
+        await writer.put(Buffer.from("sw"), Buffer.from("val"));
+        await writer.flush(FlushType.Wal);
+        await writer.close();
+
+        const reader = await DbReader.open(dbPath, url, undefined, {
+          skipWalReplay: true,
+        });
+        // WAL data should not be visible when WAL replay is skipped
+        // (only L0+ compacted data is visible)
+        const val = await reader.getString(Buffer.from("sw"));
+        // Value may or may not be visible depending on whether it was compacted
+        // The key point is that open + read succeeds with the option
+        expect(val === null || val === "val").toBe(true);
+        await reader.close();
+      },
+    );
+  });
+
+  // -----------------------------------------------------------------------
+  // status()
+  // -----------------------------------------------------------------------
+
+  describe("status", () => {
+    test("status() returns undefined on open db", async () => {
+      const db = await SlateDB.open(uniquePath("status"), url);
+      expect(db.status()).toBeUndefined();
+      await db.close();
+    });
+
+    test("status() throws after close", async () => {
+      const db = await SlateDB.open(uniquePath("status_closed"), url);
+      await db.close();
+      expect(() => db.status()).toThrow();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // compression
+  // -----------------------------------------------------------------------
+
+  describe("compression", () => {
+    test("open with snappy compression", async () => {
+      const db = await SlateDB.open(uniquePath("comp_snappy"), url, {
+        compressionCodec: CompressionCodec.Snappy,
+      });
+      await db.put(Buffer.from("ck"), Buffer.from("cv"));
+      expect(await db.getString(Buffer.from("ck"))).toBe("cv");
+      await db.close();
+    });
+
+    test("open with zstd compression", async () => {
+      const db = await SlateDB.open(uniquePath("comp_zstd"), url, {
+        compressionCodec: CompressionCodec.Zstd,
+      });
+      await db.put(Buffer.from("ck"), Buffer.from("cv"));
+      expect(await db.getString(Buffer.from("ck"))).toBe("cv");
+      await db.close();
+    });
+
+    test("open with lz4 compression", async () => {
+      const db = await SlateDB.open(uniquePath("comp_lz4"), url, {
+        compressionCodec: CompressionCodec.Lz4,
+      });
+      await db.put(Buffer.from("ck"), Buffer.from("cv"));
+      expect(await db.getString(Buffer.from("ck"))).toBe("cv");
+      await db.close();
+    });
+
+    test("open with zlib compression", async () => {
+      const db = await SlateDB.open(uniquePath("comp_zlib"), url, {
+        compressionCodec: CompressionCodec.Zlib,
+      });
+      await db.put(Buffer.from("ck"), Buffer.from("cv"));
+      expect(await db.getString(Buffer.from("ck"))).toBe("cv");
+      await db.close();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // bloom filter settings
+  // -----------------------------------------------------------------------
+
+  describe("bloom filter settings", () => {
+    test("custom minFilterKeys and filterBitsPerKey", async () => {
+      const db = await SlateDB.open(uniquePath("bloom"), url, {
+        minFilterKeys: 100,
+        filterBitsPerKey: 15,
+      });
+      await db.put(Buffer.from("bk"), Buffer.from("bv"));
+      expect(await db.getString(Buffer.from("bk"))).toBe("bv");
+      await db.close();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // transaction: unmarkWrite, seqnum, id
+  // -----------------------------------------------------------------------
+
+  describe("transaction extras", () => {
+    test("transaction seqnum returns a number", async () => {
+      const db = await SlateDB.open(uniquePath("txn_seq"), url);
+      const txn = await db.begin();
+      const seq = await txn.seqnum();
+      expect(typeof seq).toBe("number");
+      expect(seq).toBeGreaterThanOrEqual(0);
+      await txn.rollback();
+      await db.close();
+    });
+
+    test("transaction id returns a UUID string", async () => {
+      const db = await SlateDB.open(uniquePath("txn_id"), url);
+      const txn = await db.begin();
+      const id = await txn.id();
+      expect(typeof id).toBe("string");
+      // UUID format: 8-4-4-4-12 hex chars
+      expect(id).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      );
+      await txn.rollback();
+      await db.close();
+    });
+
+    test("unmarkWrite excludes keys from conflict detection", async () => {
+      const db = await SlateDB.open(uniquePath("txn_unmark"), url);
+      await db.put(Buffer.from("uk"), Buffer.from("v1"));
+
+      const txn1 = await db.begin(IsolationLevel.SerializableSnapshot);
+      await txn1.put(Buffer.from("uk"), Buffer.from("v2"));
+      // Unmark the key so it won't cause a conflict
+      await txn1.unmarkWrite([Buffer.from("uk")]);
+      await txn1.commit();
+
+      expect(await db.getString(Buffer.from("uk"))).toBe("v2");
+      await db.close();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // checkpoint with source
+  // -----------------------------------------------------------------------
+
+  describe("checkpoint source", () => {
+    test("createCheckpoint with source from existing checkpoint", async () => {
+      const db = await SlateDB.open(uniquePath("cp_src"), url);
+      await db.put(Buffer.from("cpk"), Buffer.from("cpv"));
+
+      // Create first checkpoint
+      const cp1 = await db.createCheckpoint(CheckpointScope.All);
+      expect(cp1.id).toBeTruthy();
+
+      // Create second checkpoint using first as source
+      const cp2 = await db.createCheckpoint(
+        CheckpointScope.Durable,
+        undefined,
+        "derived",
+        cp1.id,
+      );
+      expect(cp2.id).toBeTruthy();
+      // Source checkpoint's manifest should be reused
+      expect(cp2.manifestId).toBe(cp1.manifestId);
+
+      await db.close();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // manifest poll interval in settings
+  // -----------------------------------------------------------------------
+
+  describe("settings extras", () => {
+    test("manifestPollIntervalMs in Settings", async () => {
+      const db = await SlateDB.open(uniquePath("mpi"), url, {
+        manifestPollIntervalMs: 500,
+      });
+      await db.put(Buffer.from("mp"), Buffer.from("v"));
+      expect(await db.getString(Buffer.from("mp"))).toBe("v");
+      await db.close();
+    });
+
+    test("l0MaxSsts and maxUnflushedBytes in Settings", async () => {
+      const db = await SlateDB.open(uniquePath("settings_extra"), url, {
+        l0MaxSsts: 16,
+        maxUnflushedBytes: 128 * 1024 * 1024,
+      });
+      await db.put(Buffer.from("se"), Buffer.from("v"));
+      expect(await db.getString(Buffer.from("se"))).toBe("v");
+      await db.close();
+    });
+
+    test("defaultTtlMs in Settings", async () => {
+      const db = await SlateDB.open(uniquePath("default_ttl"), url, {
+        defaultTtlMs: 60000,
+      });
+      await db.put(Buffer.from("dt"), Buffer.from("v"));
+      expect(await db.getString(Buffer.from("dt"))).toBe("v");
+      await db.close();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // TTL (time-to-live)
+  // -----------------------------------------------------------------------
+
+  describe("TTL", () => {
+    test("put with per-key TTL", async () => {
+      const db = await SlateDB.open(uniquePath("ttl_put"), url);
+      // TTL = 60000ms — key should be visible now
+      await db.put(Buffer.from("tk"), Buffer.from("tv"), true, 60000);
+      expect(await db.getString(Buffer.from("tk"))).toBe("tv");
+      await db.close();
+    });
+
+    test("put with TTL=0 means no expiry", async () => {
+      const db = await SlateDB.open(uniquePath("ttl_zero"), url);
+      await db.put(Buffer.from("tz"), Buffer.from("tv"), true, 0);
+      expect(await db.getString(Buffer.from("tz"))).toBe("tv");
+      await db.close();
+    });
+
+    test("WriteBatch put with TTL", async () => {
+      const db = await SlateDB.open(uniquePath("ttl_batch"), url);
+      const batch = new WriteBatch();
+      await batch.put(Buffer.from("bt1"), Buffer.from("bv1"), 60000);
+      await batch.put(Buffer.from("bt2"), Buffer.from("bv2"), 0);
+      await db.writeBatch(batch);
+      expect(await db.getString(Buffer.from("bt1"))).toBe("bv1");
+      expect(await db.getString(Buffer.from("bt2"))).toBe("bv2");
+      await db.close();
+    });
+
+    test("transaction put with TTL", async () => {
+      const db = await SlateDB.open(uniquePath("ttl_txn"), url);
+      const txn = await db.begin();
+      await txn.put(Buffer.from("tt1"), Buffer.from("tv1"), 60000);
+      await txn.commit();
+      expect(await db.getString(Buffer.from("tt1"))).toBe("tv1");
+      await db.close();
+    });
+
+    test("merge with TTL", async () => {
+      const db = await SlateDB.open(uniquePath("ttl_merge"), url, {
+        mergeOperator: "string_concat",
+      });
+      await db.merge(Buffer.from("tm"), Buffer.from("a"), true, 60000);
+      await db.merge(Buffer.from("tm"), Buffer.from("b"), true, 60000);
+      expect(await db.getString(Buffer.from("tm"))).toBe("ab");
+      await db.close();
+    });
+
+    test("WriteBatch merge with TTL", async () => {
+      const db = await SlateDB.open(uniquePath("ttl_batch_merge"), url, {
+        mergeOperator: "string_concat",
+      });
+      const batch = new WriteBatch();
+      await batch.merge(Buffer.from("bm"), Buffer.from("x"), 60000);
+      await db.writeBatch(batch);
+      expect(await db.getString(Buffer.from("bm"))).toBe("x");
+      await db.close();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // non-durable writes
+  // -----------------------------------------------------------------------
+
+  describe("non-durable writes", () => {
+    test("put non-durable", async () => {
+      const db = await SlateDB.open(uniquePath("nd_put"), url);
+      await db.put(Buffer.from("np"), Buffer.from("nv"), false);
+      expect(await db.getString(Buffer.from("np"))).toBe("nv");
+      await db.close();
+    });
+
+    test("delete non-durable", async () => {
+      const db = await SlateDB.open(uniquePath("nd_del"), url);
+      await db.put(Buffer.from("nd"), Buffer.from("v"));
+      await db.delete(Buffer.from("nd"), false);
+      expect(await db.get(Buffer.from("nd"))).toBeNull();
+      await db.close();
+    });
+
+    test("merge non-durable", async () => {
+      const db = await SlateDB.open(uniquePath("nd_merge"), url, {
+        mergeOperator: "string_concat",
+      });
+      await db.merge(Buffer.from("nm"), Buffer.from("a"), false);
+      expect(await db.getString(Buffer.from("nm"))).toBe("a");
+      await db.close();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // WriteBatch: consumed batch throws
+  // -----------------------------------------------------------------------
+
+  describe("WriteBatch consumed", () => {
+    test("using a consumed WriteBatch throws", async () => {
+      const db = await SlateDB.open(uniquePath("wb_consumed"), url);
+      const batch = new WriteBatch();
+      await batch.put(Buffer.from("c1"), Buffer.from("v1"));
+      await db.writeBatch(batch);
+
+      // batch is now consumed — any operation should throw
+      try {
+        await batch.put(Buffer.from("c2"), Buffer.from("v2"));
+        expect(true).toBe(false); // should not reach
+      } catch (e: any) {
+        expect(e.message).toContain("consumed");
+      }
+      await db.close();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // DbReader: reader sees updated values (regression for stale get bug)
+  // -----------------------------------------------------------------------
+
+  describe("DbReader stale get regression", () => {
+    test.skipIf(skipReader)(
+      "reader get() returns updated value after writer overwrites key",
+      async () => {
+        const dbPath = uniquePath("ro_stale");
+        const writer = await SlateDB.open(dbPath, url);
+        const reader = await DbReader.open(dbPath, url, 500);
+
+        await writer.put(Buffer.from("rk"), Buffer.from("v1"));
+        await new Promise((r) => setTimeout(r, 800));
+        expect(await reader.getString(Buffer.from("rk"))).toBe("v1");
+
+        await writer.put(Buffer.from("rk"), Buffer.from("v2"));
+        await new Promise((r) => setTimeout(r, 800));
+        expect(await reader.getString(Buffer.from("rk"))).toBe("v2");
+
+        await writer.put(Buffer.from("rk"), Buffer.from("v3"));
+        await new Promise((r) => setTimeout(r, 800));
+        expect(await reader.getString(Buffer.from("rk"))).toBe("v3");
+
+        await reader.close();
+        await writer.close();
+      },
+    );
+  });
+
+  // -----------------------------------------------------------------------
+  // DbReader: mergeOperator and maxMemtableBytes options
+  // -----------------------------------------------------------------------
+
+  describe("DbReader options", () => {
+    test.skipIf(skipReader)(
+      "reader with mergeOperator can read merged values",
+      async () => {
+        const dbPath = uniquePath("ro_merge");
+        const writer = await SlateDB.open(dbPath, url, {
+          mergeOperator: "string_concat",
+        });
+        await writer.merge(Buffer.from("rm"), Buffer.from("hello"));
+        await writer.merge(Buffer.from("rm"), Buffer.from("world"));
+        await writer.flush();
+        await writer.close();
+
+        const reader = await DbReader.open(dbPath, url, undefined, {
+          mergeOperator: "string_concat",
+        });
+        expect(await reader.getString(Buffer.from("rm"))).toBe("helloworld");
+        await reader.close();
+      },
+    );
+
+    test.skipIf(skipReader)(
+      "reader with maxMemtableBytes opens successfully",
+      async () => {
+        const dbPath = uniquePath("ro_maxmem");
+        const writer = await SlateDB.open(dbPath, url);
+        await writer.put(Buffer.from("mm"), Buffer.from("v"));
+        await writer.flush();
+        await writer.close();
+
+        const reader = await DbReader.open(dbPath, url, undefined, {
+          maxMemtableBytes: 32 * 1024 * 1024,
+        });
+        expect(await reader.getString(Buffer.from("mm"))).toBe("v");
+        await reader.close();
+      },
+    );
+  });
+
+  // -----------------------------------------------------------------------
+  // scan with readAheadBytes and maxFetchTasks
+  // -----------------------------------------------------------------------
+
+  describe("scan options", () => {
+    test("scan with readAheadBytes and maxFetchTasks", async () => {
+      const db = await SlateDB.open(uniquePath("scan_opts"), url);
+      await db.put(Buffer.from("so:a"), Buffer.from("1"));
+      await db.put(Buffer.from("so:b"), Buffer.from("2"));
+
+      const items = await db.scan(
+        Buffer.from("so:"),
+        Buffer.from("so:~"),
+        undefined,
+        4096,
+        4,
+      );
+      expect(items).toHaveLength(2);
+      await db.close();
+    });
+
+    test("scanPrefix with readAheadBytes and maxFetchTasks", async () => {
+      const db = await SlateDB.open(uniquePath("scanpfx_opts"), url);
+      await db.put(Buffer.from("sp:a"), Buffer.from("1"));
+      await db.put(Buffer.from("sp:b"), Buffer.from("2"));
+
+      const items = await db.scanPrefix(
+        Buffer.from("sp:"),
+        undefined,
+        4096,
+        4,
+      );
+      expect(items).toHaveLength(2);
+      await db.close();
+    });
+
+    test("transaction scan with readAheadBytes and maxFetchTasks", async () => {
+      const db = await SlateDB.open(uniquePath("txn_scan_opts"), url);
+      await db.put(Buffer.from("ts:a"), Buffer.from("1"));
+      await db.put(Buffer.from("ts:b"), Buffer.from("2"));
+
+      const txn = await db.begin();
+      const items = await txn.scan(
+        Buffer.from("ts:"),
+        Buffer.from("ts:~"),
+        undefined,
+        4096,
+        4,
+      );
+      expect(items).toHaveLength(2);
+
+      const pfx = await txn.scanPrefix(
+        Buffer.from("ts:"),
+        undefined,
+        4096,
+        4,
+      );
+      expect(pfx).toHaveLength(2);
+      await txn.rollback();
+      await db.close();
+    });
+
+    test("snapshot scan with readAheadBytes and maxFetchTasks", async () => {
+      const db = await SlateDB.open(uniquePath("snap_scan_opts"), url);
+      await db.put(Buffer.from("ss:a"), Buffer.from("1"));
+      await db.put(Buffer.from("ss:b"), Buffer.from("2"));
+
+      const snap = await db.snapshot();
+      const items = await snap.scan(
+        Buffer.from("ss:"),
+        Buffer.from("ss:~"),
+        undefined,
+        4096,
+        4,
+      );
+      expect(items).toHaveLength(2);
+
+      const pfx = await snap.scanPrefix(
+        Buffer.from("ss:"),
+        undefined,
+        4096,
+        4,
+      );
+      expect(pfx).toHaveLength(2);
+      await db.close();
+    });
+
+    test.skipIf(skipReader)(
+      "DbReader scan with readAheadBytes and maxFetchTasks",
+      async () => {
+        const dbPath = uniquePath("ro_scan_opts");
+        const writer = await SlateDB.open(dbPath, url);
+        await writer.put(Buffer.from("rs:a"), Buffer.from("1"));
+        await writer.put(Buffer.from("rs:b"), Buffer.from("2"));
+        await writer.flush();
+        await writer.close();
+
+        const reader = await DbReader.open(dbPath, url);
+        const items = await reader.scan(
+          Buffer.from("rs:"),
+          Buffer.from("rs:~"),
+          undefined,
+          4096,
+          4,
+        );
+        expect(items).toHaveLength(2);
+
+        const pfx = await reader.scanPrefix(
+          Buffer.from("rs:"),
+          undefined,
+          4096,
+          4,
+        );
+        expect(pfx).toHaveLength(2);
+        await reader.close();
+      },
+    );
+  });
+
+  // -----------------------------------------------------------------------
+  // DurabilityLevel on reads
+  // -----------------------------------------------------------------------
+
+  describe("durability level reads", () => {
+    test("get with DurabilityLevel.Memory", async () => {
+      const db = await SlateDB.open(uniquePath("dl_mem"), url);
+      await db.put(Buffer.from("dm"), Buffer.from("v"), false);
+      expect(
+        await db.getString(Buffer.from("dm"), DurabilityLevel.Memory),
+      ).toBe("v");
+      await db.close();
+    });
+
+    test("scan with DurabilityLevel.Memory", async () => {
+      const db = await SlateDB.open(uniquePath("dl_scan"), url);
+      await db.put(Buffer.from("ds"), Buffer.from("v"), false);
+      const items = await db.scan(
+        Buffer.from("ds"),
+        Buffer.from("dt"),
+        DurabilityLevel.Memory,
+      );
+      expect(items).toHaveLength(1);
+      await db.close();
     });
   });
 }

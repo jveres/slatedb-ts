@@ -34,7 +34,7 @@ cargo build --release --no-default-features --features moka
 ```typescript
 import {
   SlateDB, DbReader, WriteBatch, IsolationLevel,
-  DurabilityLevel, FlushType, CheckpointScope,
+  DurabilityLevel, FlushType, CheckpointScope, CompressionCodec,
 } from "./index";
 
 // Open — in-memory, local filesystem, or cloud
@@ -170,12 +170,16 @@ bun run bencher -- db --url "s3://my-bucket--use1-az4--x-s3" --duration 30
 
 ```typescript
 type Settings = {
-  flushIntervalMs?: number;    // WAL flush interval (null = disable auto-flush)
-  l0SstSizeBytes?: number;     // Min memtable size before flush to L0
-  l0MaxSsts?: number;          // Max L0 SSTs before backpressure
-  maxUnflushedBytes?: number;  // Max unflushed bytes before writer backpressure
-  defaultTtlMs?: number;       // Default TTL for put operations (null = no expiry)
-  mergeOperator?: string;      // "string_concat" or "uint64_add" (null = no merge)
+  flushIntervalMs?: number;         // WAL flush interval (null = disable auto-flush)
+  l0SstSizeBytes?: number;          // Min memtable size before flush to L0
+  l0MaxSsts?: number;               // Max L0 SSTs before backpressure
+  maxUnflushedBytes?: number;       // Max unflushed bytes before writer backpressure
+  defaultTtlMs?: number;            // Default TTL for put operations (null = no expiry)
+  mergeOperator?: string;           // "string_concat" or "uint64_add" (null = no merge)
+  manifestPollIntervalMs?: number;  // Manifest poll interval (default: 1000ms)
+  compressionCodec?: CompressionCodec; // Snappy, Zlib, Lz4, Zstd (null = none)
+  minFilterKeys?: number;           // Bloom filter threshold (default: 0)
+  filterBitsPerKey?: number;        // Bloom filter bits per key (default: 10)
 };
 ```
 
@@ -193,7 +197,7 @@ type Settings = {
 
 ### DbReader
 
-#### `await DbReader.open(path, url?, manifestPollIntervalMs?)`
+#### `await DbReader.open(path, url?, manifestPollIntervalMs?, options?)`
 
 Open a read-only reader. Multiple readers can access the same DB path concurrently alongside a single writer. The reader does not fence the writer.
 
@@ -202,6 +206,14 @@ The reader automatically picks up new writes via manifest polling and WAL replay
 ```typescript
 // Fast-polling reader (1s)
 const reader = await DbReader.open("/my-db", "s3://my-bucket", 1000);
+
+// Advanced options
+const reader2 = await DbReader.open("/my-db", "s3://my-bucket", undefined, {
+  manifestPollIntervalMs: 1000,
+  mergeOperator: "uint64_add",     // needed if DB uses merge
+  skipWalReplay: false,            // true = only see compacted data
+  maxMemtableBytes: 64 * 1024 * 1024,
+});
 ```
 
 | Method | Description |
@@ -302,8 +314,11 @@ Begin an ACID transaction. Returns a `Transaction` object.
 | `await txn.delete(key)` | Delete within the transaction |
 | `await txn.merge(key, value, ttl?)` | Merge within the transaction |
 | `await txn.markRead(keys)` | Mark keys as read for SSI conflict detection |
-| `await txn.scan(start?, end?, durabilityLevel?)` | Range scan within the transaction |
-| `await txn.scanPrefix(prefix, durabilityLevel?)` | Prefix scan within the transaction |
+| `await txn.unmarkWrite(keys)` | Exclude keys from write conflict detection |
+| `await txn.scan(start?, end?, durabilityLevel?, readAheadBytes?, maxFetchTasks?)` | Range scan within the transaction |
+| `await txn.scanPrefix(prefix, durabilityLevel?, readAheadBytes?, maxFetchTasks?)` | Prefix scan within the transaction |
+| `await txn.seqnum()` | Get the snapshot sequence number |
+| `await txn.id()` | Get the transaction UUID |
 | `await txn.commit(awaitDurable?)` | Commit (throws on conflict) |
 | `await txn.rollback()` | Abort the transaction |
 
@@ -326,13 +341,14 @@ Create a read-only point-in-time view. Subsequent writes to the database are not
 
 ### Checkpoints
 
-#### `await db.createCheckpoint(scope?, lifetimeMs?, name?)`
+#### `await db.createCheckpoint(scope?, lifetimeMs?, name?, source?)`
 
 Create a checkpoint for backup/restore. Returns `{ id: string, manifestId: number }`.
 
 - `scope` — `CheckpointScope.All` (default, flushes all data first) or `CheckpointScope.Durable` (only already-durable data, faster)
 - `lifetimeMs` — optional checkpoint lifetime in milliseconds (null = no expiry)
 - `name` — optional human-readable name
+- `source` — optional UUID string of an existing checkpoint to derive from (reuses its manifest)
 
 ---
 
@@ -341,6 +357,14 @@ Create a checkpoint for backup/restore. Returns `{ id: string, manifestId: numbe
 #### `db.metrics()` → `Metric[]`
 
 Get runtime statistics as an array of `{ name: string, value: number }`. Includes counters for memtable operations, SST writes, compaction, cache hits/misses, etc.
+
+---
+
+### Status
+
+#### `db.status()`
+
+Check if the database is still open. Returns `undefined` if the database is open and healthy. Throws if the database has been closed, fenced by another writer, or shut down due to a background task error.
 
 ---
 
@@ -363,9 +387,10 @@ Close the database and free native resources. Flushes pending data before closin
 
 ```typescript
 export { SlateDB, DbReader, WriteBatch, Transaction, Snapshot,
-         IsolationLevel, DurabilityLevel, FlushType, CheckpointScope };
+         IsolationLevel, DurabilityLevel, FlushType, CheckpointScope,
+         CompressionCodec };
 export default SlateDB;
-export type { KeyValue, Settings, CheckpointResult, Metric };
+export type { KeyValue, Settings, DbReaderOptions, CheckpointResult, Metric };
 ```
 
 ## Compaction
@@ -374,26 +399,39 @@ Compaction is **fully automatic**. When `SlateDB.open()` is called, SlateDB spaw
 
 ## Test
 
-Integration tests are organized in 16 groups — 53 tests total:
+Integration tests are organized in 25 groups — 88 tests total:
 
-| Group                   | Tests | Description                                                    |
-| ----------------------- | ----: | -------------------------------------------------------------- |
-| **full_example.rs**     |     5 | Ported from SlateDB's [`examples/src/full_example.rs`](https://github.com/slatedb/slatedb/blob/main/examples/src/full_example.rs) |
-| **write batch**         |     4 | Atomic multi-put, deletes, non-durable, free-without-write     |
-| **transactions**        |     7 | Commit, rollback, read-your-writes, delete, isolation, markRead |
-| **bridge extras**       |     8 | Binary keys, empty values, overwrite, scan order, edge cases   |
-| **scan_prefix**         |     3 | Prefix scan, no matches, different prefixes                    |
-| **snapshot**            |     4 | Point-in-time reads, snapshot scan, scanPrefix, getString      |
-| **merge — string_concat** |  3 | Concatenation, create on merge, multiple merges                |
-| **merge — uint64_add**    |  2 | Counter addition, create from zero                             |
-| **WriteBatch merge**    |     1 | Merge operations in batches                                    |
-| **transaction scan**    |     3 | Transaction scan, scanPrefix, merge within transactions        |
-| **flush options**       |     2 | FlushType.Wal and FlushType.MemTable                           |
-| **metrics**             |     1 | Runtime stats shape validation                                 |
-| **checkpoint**          |     2 | Create with defaults, create with name and lifetime            |
-| **open with settings**  |     2 | Custom settings, unknown merge operator error                  |
-| **getString**           |     3 | DB getString, missing key, transaction getString               |
-| **DbReader**            |     3 | Reader get/scan, multiple readers (skipped on `:memory:`)      |
+| Group                      | Tests | Description                                                    |
+| -------------------------- | ----: | -------------------------------------------------------------- |
+| **full_example.rs**        |     5 | Ported from SlateDB's [`examples/src/full_example.rs`](https://github.com/slatedb/slatedb/blob/main/examples/src/full_example.rs) |
+| **write batch**            |     4 | Atomic multi-put, deletes, non-durable, free-without-write     |
+| **transactions**           |     7 | Commit, rollback, read-your-writes, delete, isolation, markRead |
+| **bridge extras**          |     8 | Binary keys, empty values, overwrite, scan order, edge cases   |
+| **scan_prefix**            |     3 | Prefix scan, no matches, different prefixes                    |
+| **snapshot**               |     4 | Point-in-time reads, snapshot scan, scanPrefix, getString      |
+| **merge — string_concat**  |     3 | Concatenation, create on merge, multiple merges                |
+| **merge — uint64_add**     |     2 | Counter addition, create from zero                             |
+| **WriteBatch merge**       |     1 | Merge operations in batches                                    |
+| **transaction scan**       |     3 | Transaction scan, scanPrefix, merge within transactions        |
+| **flush options**          |     2 | FlushType.Wal and FlushType.MemTable                           |
+| **metrics**                |     1 | Runtime stats shape validation                                 |
+| **checkpoint**             |     2 | Create with defaults, create with name and lifetime            |
+| **open with settings**     |     2 | Custom settings, unknown merge operator error                  |
+| **getString**              |     3 | DB getString, missing key, transaction getString               |
+| **DbReader**               |     4 | Reader get/scan, multiple readers, skipWalReplay               |
+| **status**                 |     2 | Status on open DB, throws after close                          |
+| **compression**            |     4 | Snappy, Zstd, Lz4, Zlib codecs                                |
+| **bloom filter settings**  |     1 | Custom minFilterKeys and filterBitsPerKey                      |
+| **transaction extras**     |     3 | seqnum, id (UUID), unmarkWrite for SSI                         |
+| **checkpoint source**      |     1 | Create checkpoint from existing checkpoint                     |
+| **settings extras**        |     3 | manifestPollIntervalMs, l0MaxSsts, defaultTtlMs               |
+| **TTL**                    |     6 | Per-key TTL, TTL=0, WriteBatch/transaction/merge with TTL      |
+| **non-durable writes**     |     3 | Non-durable put, delete, merge                                 |
+| **WriteBatch consumed**    |     1 | Consumed batch throws on reuse                                 |
+| **DbReader stale get**     |     1 | Regression: reader sees updated values (not stale)             |
+| **DbReader options**       |     2 | mergeOperator, maxMemtableBytes options                        |
+| **scan options**           |     5 | readAheadBytes/maxFetchTasks on DB, txn, snapshot, reader      |
+| **durability level reads** |     2 | DurabilityLevel.Memory on get and scan                         |
 
 ```bash
 # In-memory (default)
@@ -503,10 +541,10 @@ The Rust layer (`src/lib.rs`) exposes native JS classes via napi-rs `#[napi]` ma
 
 | Class             | Methods                                                                         | Purpose                    |
 | ----------------- | ------------------------------------------------------------------------------- | -------------------------- |
-| **SlateDB**       | `open`, `close`, `put`, `get`, `getString`, `delete`, `merge`, `flush`, `scan`, `scanPrefix`, `writeBatch`, `begin`, `snapshot`, `createCheckpoint`, `metrics` | Database lifecycle + all ops |
+| **SlateDB**       | `open`, `close`, `put`, `get`, `getString`, `delete`, `merge`, `flush`, `scan`, `scanPrefix`, `writeBatch`, `begin`, `snapshot`, `createCheckpoint`, `metrics`, `status` | Database lifecycle + all ops |
 | **DbReader**      | `open`, `close`, `get`, `getString`, `scan`, `scanPrefix`                       | Read-only multi-reader     |
 | **WriteBatch**    | `new`, `put`, `merge`, `delete`, `free`                                         | Atomic batch writes        |
-| **Transaction**   | `put`, `get`, `getString`, `delete`, `merge`, `markRead`, `scan`, `scanPrefix`, `commit`, `rollback` | ACID transactions          |
+| **Transaction**   | `put`, `get`, `getString`, `delete`, `merge`, `markRead`, `unmarkWrite`, `scan`, `scanPrefix`, `seqnum`, `id`, `commit`, `rollback` | ACID transactions          |
 | **Snapshot**      | `get`, `getString`, `scan`, `scanPrefix`                                        | Read-only point-in-time    |
 
 All async Rust futures are automatically converted to JS Promises by napi-rs. The Tokio runtime is managed internally by napi-rs.

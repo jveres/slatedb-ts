@@ -64,6 +64,9 @@ export const FlushType = native.JsFlushType;
 /** Checkpoint scopes. */
 export const CheckpointScope = native.JsCheckpointScope;
 
+/** Compression codecs for SST files. */
+export const CompressionCodec = native.JsCompressionCodec;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -77,6 +80,17 @@ export type Settings = {
   maxUnflushedBytes?: number;
   defaultTtlMs?: number;
   mergeOperator?: "string_concat" | "uint64_add";
+  manifestPollIntervalMs?: number;
+  compressionCodec?: (typeof CompressionCodec)[keyof typeof CompressionCodec];
+  minFilterKeys?: number;
+  filterBitsPerKey?: number;
+};
+
+export type DbReaderOptions = {
+  manifestPollIntervalMs?: number;
+  mergeOperator?: "string_concat" | "uint64_add";
+  skipWalReplay?: boolean;
+  maxMemtableBytes?: number;
 };
 
 export type CheckpointResult = {

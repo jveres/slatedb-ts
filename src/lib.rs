@@ -5,8 +5,9 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use slatedb::config::{
-    CheckpointOptions, CheckpointScope, DbReaderOptions, DurabilityLevel, FlushOptions, FlushType,
-    MergeOptions, PutOptions, ReadOptions, ScanOptions, Settings, Ttl, WriteOptions,
+    CheckpointOptions, CheckpointScope, CompressionCodec, DbReaderOptions, DurabilityLevel,
+    FlushOptions, FlushType, MergeOptions, PutOptions, ReadOptions, ScanOptions, Settings, Ttl,
+    WriteOptions,
 };
 use slatedb::{Db, DbIterator, DbReader, DbTransaction, WriteBatch};
 use slatedb::{MergeOperator, MergeOperatorError};
@@ -158,6 +159,28 @@ fn to_napi_err(e: slatedb::Error) -> Error {
     Error::from_reason(format!("{e}"))
 }
 
+fn resolve_merge_operator(
+    name: Option<&str>,
+) -> Result<Option<Arc<dyn MergeOperator + Send + Sync>>> {
+    match name {
+        Some("string_concat") => Ok(Some(Arc::new(StringConcatMergeOperator))),
+        Some("uint64_add") => Ok(Some(Arc::new(Uint64AddMergeOperator))),
+        Some(other) => Err(Error::from_reason(format!(
+            "unknown merge operator: '{other}'. Use 'string_concat' or 'uint64_add'"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn resolve_compression(codec: Option<JsCompressionCodec>) -> Option<CompressionCodec> {
+    codec.map(|c| match c {
+        JsCompressionCodec::Snappy => CompressionCodec::Snappy,
+        JsCompressionCodec::Zlib => CompressionCodec::Zlib,
+        JsCompressionCodec::Lz4 => CompressionCodec::Lz4,
+        JsCompressionCodec::Zstd => CompressionCodec::Zstd,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // KeyValue — returned from scan
 // ---------------------------------------------------------------------------
@@ -201,6 +224,14 @@ pub enum JsFlushType {
 pub enum JsCheckpointScope {
     All,
     Durable,
+}
+
+#[napi]
+pub enum JsCompressionCodec {
+    Snappy,
+    Zlib,
+    Lz4,
+    Zstd,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +294,27 @@ pub struct JsSettings {
     pub default_ttl_ms: Option<u32>,
     /// Merge operator: "string_concat" or "uint64_add". Null = no merge support.
     pub merge_operator: Option<String>,
+    /// How frequently to poll for new manifest files (milliseconds). Default: 1000ms.
+    pub manifest_poll_interval_ms: Option<u32>,
+    /// Compression codec for SST files: Snappy, Zlib, Lz4, Zstd. Null = no compression.
+    pub compression_codec: Option<JsCompressionCodec>,
+    /// Minimum number of keys in an SST before adding a bloom filter. Default: 0.
+    pub min_filter_keys: Option<u32>,
+    /// Bits per key for bloom filters. Default: 10.
+    pub filter_bits_per_key: Option<u32>,
+}
+
+/// Options for DbReader.open() — beyond the basic manifest_poll_interval_ms.
+#[napi(object)]
+pub struct JsDbReaderOptions {
+    /// How frequently to poll for new manifest files (milliseconds). Default: 10000.
+    pub manifest_poll_interval_ms: Option<u32>,
+    /// Merge operator: "string_concat" or "uint64_add". Null = no merge support.
+    pub merge_operator: Option<String>,
+    /// Skip WAL replay entirely — only see compacted data. Default: false.
+    pub skip_wal_replay: Option<bool>,
+    /// Max in-memory memtable bytes for WAL replay. Default: 64MB.
+    pub max_memtable_bytes: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -310,19 +362,17 @@ impl SlateDB {
                 if let Some(ttl) = settings.default_ttl_ms {
                     cfg.default_ttl = Some(ttl as u64);
                 }
-
-                let merge_op: Option<Arc<dyn MergeOperator + Send + Sync>> =
-                    match settings.merge_operator.as_deref() {
-                        Some("string_concat") => Some(Arc::new(StringConcatMergeOperator)),
-                        Some("uint64_add") => Some(Arc::new(Uint64AddMergeOperator)),
-                        Some(other) => {
-                            return Err(Error::from_reason(format!(
-                        "unknown merge operator: '{other}'. Use 'string_concat' or 'uint64_add'"
-                    )))
-                        }
-                        None => None,
-                    };
-                cfg.merge_operator = merge_op;
+                if let Some(ms) = settings.manifest_poll_interval_ms {
+                    cfg.manifest_poll_interval = Duration::from_millis(ms as u64);
+                }
+                if let Some(n) = settings.min_filter_keys {
+                    cfg.min_filter_keys = n;
+                }
+                if let Some(n) = settings.filter_bits_per_key {
+                    cfg.filter_bits_per_key = n;
+                }
+                cfg.compression_codec = resolve_compression(settings.compression_codec);
+                cfg.merge_operator = resolve_merge_operator(settings.merge_operator.as_deref())?;
 
                 let builder = Db::builder(path.as_str(), store).with_settings(cfg);
                 tokio::time::timeout(Duration::from_secs(30), builder.build())
@@ -575,20 +625,30 @@ impl SlateDB {
     // -----------------------------------------------------------------------
 
     /// Create a checkpoint for backup/restore.
+    ///
+    /// `source` — optional UUID string of an existing checkpoint to use as source.
     #[napi(js_name = "createCheckpoint")]
     pub async fn create_checkpoint(
         &self,
         scope: Option<JsCheckpointScope>,
         lifetime_ms: Option<f64>,
         name: Option<String>,
+        source: Option<String>,
     ) -> Result<JsCheckpointResult> {
         let s = match scope.unwrap_or(JsCheckpointScope::All) {
             JsCheckpointScope::All => CheckpointScope::All,
             JsCheckpointScope::Durable => CheckpointScope::Durable,
         };
+        let source_uuid = match source {
+            Some(ref s) => Some(
+                uuid::Uuid::parse_str(s)
+                    .map_err(|e| Error::from_reason(format!("invalid UUID: {e}")))?,
+            ),
+            None => None,
+        };
         let opts = CheckpointOptions {
             lifetime: lifetime_ms.map(|ms| Duration::from_millis(ms as u64)),
-            source: None,
+            source: source_uuid,
             name,
         };
         let result = self
@@ -627,6 +687,21 @@ impl SlateDB {
     // Close
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Status
+    // -----------------------------------------------------------------------
+
+    /// Check if the database is still open.
+    /// Returns `undefined` if open, throws if closed or fenced.
+    #[napi]
+    pub fn status(&self) -> Result<()> {
+        self.inner.status().map_err(to_napi_err)
+    }
+
+    // -----------------------------------------------------------------------
+    // Close
+    // -----------------------------------------------------------------------
+
     /// Close the database and free native resources.
     ///
     /// # Safety
@@ -650,13 +725,16 @@ pub struct JsDbReader {
 impl JsDbReader {
     /// Open a read-only reader. Multiple readers can access the same DB path
     /// concurrently alongside a single writer. The reader automatically picks up
-    /// new writes via manifest polling (default: every 10s). Configure the poll
-    /// interval with `manifest_poll_interval_ms`.
+    /// new writes via manifest polling (default: every 10s).
+    ///
+    /// Accepts either a simple `manifestPollIntervalMs` number (backward compat)
+    /// or a full `JsDbReaderOptions` object for advanced configuration.
     #[napi(factory)]
     pub async fn open(
         path: String,
         url: Option<String>,
         manifest_poll_interval_ms: Option<u32>,
+        options: Option<JsDbReaderOptions>,
     ) -> Result<JsDbReader> {
         let url = url.unwrap_or_else(|| ":memory:".to_string());
         let store = resolve_store(&url)?;
@@ -666,8 +744,30 @@ impl JsDbReader {
         }
 
         let mut opts = DbReaderOptions::default();
+
+        // Simple scalar takes precedence for backward compat
         if let Some(ms) = manifest_poll_interval_ms {
             opts.manifest_poll_interval = Duration::from_millis(ms as u64);
+        }
+
+        // Full options object
+        if let Some(ref reader_opts) = options {
+            if manifest_poll_interval_ms.is_none() {
+                if let Some(ms) = reader_opts.manifest_poll_interval_ms {
+                    opts.manifest_poll_interval = Duration::from_millis(ms as u64);
+                }
+            }
+            if let Some(skip) = reader_opts.skip_wal_replay {
+                opts.skip_wal_replay = skip;
+            }
+            if let Some(max) = reader_opts.max_memtable_bytes {
+                opts.max_memtable_bytes = max as u64;
+            }
+            opts.merge_operator = resolve_merge_operator(
+                reader_opts
+                    .merge_operator
+                    .as_deref(),
+            )?;
         }
 
         let reader = tokio::time::timeout(
@@ -997,6 +1097,38 @@ impl JsTransaction {
             .map_err(to_napi_err)
     }
 
+    /// Exclude keys from write conflict detection (SSI).
+    /// Useful when a transaction writes keys that should not trigger conflicts.
+    #[napi(js_name = "unmarkWrite")]
+    pub async fn unmark_write(&self, keys: Vec<Buffer>) -> Result<()> {
+        let guard = self.inner.lock().await;
+        let txn = guard
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
+        txn.unmark_write(keys.iter().map(|k| &k[..]))
+            .map_err(to_napi_err)
+    }
+
+    /// Get the snapshot sequence number for this transaction.
+    #[napi]
+    pub async fn seqnum(&self) -> Result<f64> {
+        let guard = self.inner.lock().await;
+        let txn = guard
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
+        Ok(txn.seqnum() as f64)
+    }
+
+    /// Get the unique transaction ID (UUID string).
+    #[napi]
+    pub async fn id(&self) -> Result<String> {
+        let guard = self.inner.lock().await;
+        let txn = guard
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
+        Ok(txn.id().to_string())
+    }
+
     /// Scan within the transaction [start, end).
     #[napi]
     pub async fn scan(
@@ -1004,12 +1136,14 @@ impl JsTransaction {
         start: Option<Buffer>,
         end: Option<Buffer>,
         read_level: Option<JsDurabilityLevel>,
+        read_ahead_bytes: Option<u32>,
+        max_fetch_tasks: Option<u32>,
     ) -> Result<Vec<KeyValue>> {
         let guard = self.inner.lock().await;
         let txn = guard
             .as_ref()
             .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
-        let opts = build_scan_options(read_level, None, None);
+        let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
         let range = make_range(&start, &end);
         let iter = txn
             .scan_with_options(range, &opts)
@@ -1024,12 +1158,14 @@ impl JsTransaction {
         &self,
         prefix: Buffer,
         read_level: Option<JsDurabilityLevel>,
+        read_ahead_bytes: Option<u32>,
+        max_fetch_tasks: Option<u32>,
     ) -> Result<Vec<KeyValue>> {
         let guard = self.inner.lock().await;
         let txn = guard
             .as_ref()
             .ok_or_else(|| Error::from_reason("Transaction already consumed"))?;
-        let opts = build_scan_options(read_level, None, None);
+        let opts = build_scan_options(read_level, read_ahead_bytes, max_fetch_tasks);
         let iter = txn
             .scan_prefix_with_options(&prefix[..], &opts)
             .await
