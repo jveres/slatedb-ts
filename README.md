@@ -399,7 +399,7 @@ Compaction is **fully automatic**. When `SlateDB.open()` is called, SlateDB spaw
 
 ## Test
 
-Integration tests are organized in 25 groups — 88 tests total:
+Integration tests are organized in 29 groups — 88 tests total:
 
 | Group                      | Tests | Description                                                    |
 | -------------------------- | ----: | -------------------------------------------------------------- |
@@ -557,7 +557,7 @@ All async Rust futures are automatically converted to JS Promises by napi-rs. Th
 ├── bunfig.toml        Bun config — 30s test timeout for cloud backends
 ├── src/lib.rs         napi-rs native classes (SlateDB, DbReader, WriteBatch, Transaction, Snapshot)
 ├── index.ts           Native module loader + re-exports
-├── test.spec.ts       Integration tests — 52 tests across 14 groups, multi-backend
+├── test.spec.ts       Integration tests — 88 tests across 29 groups, multi-backend
 ├── bench.ts           Micro-benchmark — comparison against SlateDB's Criterion bench
 ├── bencher.ts         Sustained throughput — ported from slatedb-bencher (db + transaction)
 ├── package.json       Scripts: build, test, bench, bencher, bencher:db, bencher:txn
